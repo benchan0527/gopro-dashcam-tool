@@ -1398,3 +1398,300 @@ dc.$('dc-output-name').addEventListener('change', () => dc.detectResume());
 if (dc.$('dc-output-folder').value.trim()) {
   setTimeout(() => dc.detectResume(), 500);
 }
+
+// =============================================================================
+//  Video Splitter tab controller
+// =============================================================================
+const splitter = {
+  files: [],   // [{ path, name, size }]
+  splitting: false,
+
+  $(id) { return document.getElementById(id); },
+
+  fmtBytes(n) {
+    if (!n) return '0 B';
+    const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let i = 0;
+    while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+    return `${n.toFixed(i >= 2 ? 2 : 1)} ${u[i]}`;
+  },
+
+  fmtDuration(sec) {
+    sec = Math.round(sec);
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = sec % 60;
+    if (h) return `${h}h${m}m`;
+    if (m) return `${m}m${s}s`;
+    return `${s}s`;
+  },
+
+  fmtEta(ms) {
+    if (ms == null || ms < 0) return '-';
+    const s = Math.round(ms / 1000);
+    if (s < 60) return `${s}s`;
+    const m = Math.floor(s / 60);
+    return `${m}m${s % 60}s`;
+  },
+
+  addPickedFiles(picked) {
+    if (!picked || !picked.length) return;
+    for (const f of picked) {
+      // Avoid duplicates by full path
+      if (!this.files.some((x) => x.path === f.path)) this.files.push(f);
+    }
+    this.renderFiles();
+    this.updateStartBtn();
+  },
+
+  async pickFiles() {
+    const r = await electronAPI.dashcamPickSplitFiles();
+    if (r.canceled) return;
+    this.addPickedFiles(r.files);
+  },
+
+  clearFiles() {
+    this.files = [];
+    this.renderFiles();
+    this.updateStartBtn();
+  },
+
+  removeFile(path) {
+    this.files = this.files.filter((f) => f.path !== path);
+    this.renderFiles();
+    this.updateStartBtn();
+  },
+
+  renderFiles() {
+    const list = this.$('sp-files-list');
+    if (!list) return;
+    if (!this.files.length) {
+      list.innerHTML = '';
+      this.$('sp-files-display').value = '';
+      this.$('sp-files-summary').textContent = '';
+      return;
+    }
+    this.$('sp-files-display').value = `${this.files.length} file(s) selected`;
+    const totalSize = this.files.reduce((a, b) => a + (b.size || 0), 0);
+    this.$('sp-files-summary').textContent =
+      `Total: ${this.files.length} file(s), ${this.fmtBytes(totalSize)}`;
+
+    list.innerHTML = this.files.map((f) => {
+      const fileName = (f.name || '').replace(/[<>&"']/g, (c) => ({
+        '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&#39;'
+      }[c]));
+      return `<div class="sp-file-row" data-path="${(f.path || '').replace(/"/g, '&quot;')}" style="display:flex;align-items:center;gap:8px;padding:4px 8px;border-bottom:1px solid rgba(255,255,255,0.06);">
+        <span style="flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${fileName}">${fileName}</span>
+        <span style="flex:0 0 90px;text-align:right;color:#9ab;font-size:0.85em">${this.fmtBytes(f.size)}</span>
+        <button class="btn btn-secondary sp-remove" data-path="${(f.path || '').replace(/"/g, '&quot;')}" style="padding:2px 8px;font-size:0.85em">Remove</button>
+      </div>`;
+    }).join('');
+    list.querySelectorAll('.sp-remove').forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        this.removeFile(btn.dataset.path);
+      });
+    });
+  },
+
+  async pickOutput() {
+    const r = await electronAPI.dashcamPickOutput();
+    if (r.canceled) return;
+    this.$('sp-output-folder').value = r.folder;
+    this.updateStartBtn();
+  },
+
+  updateStartBtn() {
+    const ok = this.files.length > 0
+      && (this.$('sp-output-folder').value || '').trim()
+      && !this.splitting;
+    this.$('sp-start').disabled = !ok;
+    this.$('sp-clear-files').disabled = this.files.length === 0;
+  },
+
+  setInfo(key, value, highlight = false, warn = false) {
+    const el = this.$('sp-info-' + key);
+    if (!el) return;
+    el.textContent = value;
+    el.classList.remove('warn', 'highlight');
+    if (warn) el.classList.add('warn');
+    else if (highlight) el.classList.add('highlight');
+  },
+
+  resetProgress() {
+    this.$('sp-progress-bar').style.width = '0%';
+    this.$('sp-progress-text').textContent = 'Starting...';
+    this.$('sp-eta').textContent = '';
+    this.$('sp-current-file').textContent = '';
+    this.setInfo('stage', 'Starting');
+    this.setInfo('current', '-');
+    this.setInfo('progress', '0%');
+    this.setInfo('parts', '0');
+    this.setInfo('eta', '-');
+    this.setInfo('elapsed', '-');
+  },
+
+  async startSplit() {
+    if (this.splitting) return;
+    if (!this.files.length) return;
+    const outDir = (this.$('sp-output-folder').value || '').trim();
+    if (!outDir) return;
+
+    this.splitting = true;
+    this.$('sp-start').disabled = true;
+    this.$('sp-cancel').disabled = false;
+    this.$('sp-result').style.display = 'none';
+    this.resetProgress();
+
+    const options = {
+      files: this.files.map((f) => f.path),
+      outputDir: outDir,
+      outputName: this.$('sp-output-name').value.trim(),
+      maxSegmentBytes: Math.max(1, parseInt(this.$('sp-max-gb').value, 10) || 256) * 1024 * 1024 * 1024,
+      maxSegmentSeconds: Math.max(1, parseInt(this.$('sp-max-hours').value, 10) || 12) * 3600
+    };
+
+    const r = await electronAPI.dashcamSplit(options);
+    this.splitting = false;
+    this.$('sp-cancel').disabled = true;
+    this.updateStartBtn();
+
+    if (r.cancelled) {
+      this.$('sp-result').style.display = 'block';
+      this.$('sp-result').className = 'result-box warn';
+      this.$('sp-result').textContent = 'Cancelled.';
+      return;
+    }
+    if (!r.success) {
+      this.$('sp-result').style.display = 'block';
+      this.$('sp-result').className = 'result-box error';
+      this.$('sp-result').textContent = `Failed: ${r.error || 'Unknown error'}`;
+      return;
+    }
+
+    // Success — show result
+    const out = r.outputPaths || [];
+    const totalSize = out.reduce((a, b) => a + (b.size || 0), 0);
+    const totalGB = (totalSize / 1024 / 1024 / 1024).toFixed(2);
+    this.$('sp-progress-bar').style.width = '100%';
+    let msg = `Done - ${out.length} part${out.length === 1 ? '' : 's'}, ${totalGB} GB`;
+    if (r.skippedCount > 0) {
+      const names = (r.skippedInputs || []).map((s) => s.file).join(', ');
+      msg += ` - ${r.skippedCount} skipped: ${names}`;
+    }
+    this.$('sp-progress-text').textContent = msg;
+    this.$('sp-eta').textContent = '';
+
+    this.$('sp-result').style.display = 'block';
+    this.$('sp-result').className = 'result-box';
+
+    const revealDir = out.length ? out[0].path.split(/[\\/]/).slice(0, -1).join('\\') : '';
+    let revealBtn = '';
+    if (out.length) {
+      const firstPath = out[0].path;
+      revealBtn =
+        `<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;">
+          <button class="btn btn-primary" id="sp-reveal-first">Reveal first part</button>
+          <button class="btn btn-secondary" id="sp-reveal-dir">Open output folder</button>
+        </div>`;
+      setTimeout(() => {
+        const r1 = this.$('sp-reveal-first');
+        const r2 = this.$('sp-reveal-dir');
+        if (r1) r1.addEventListener('click', () => electronAPI.dashcamReveal(firstPath));
+        if (r2) r2.addEventListener('click', () => electronAPI.dashcamReveal(firstPath));
+      }, 0);
+    }
+
+    const list = out.map((p) =>
+      `<li style="margin:2px 0"><code>${p.path.split(/[\\/]/).pop()}</code> - ${this.fmtBytes(p.size)}</li>`
+    ).join('');
+    const skip = (r.skippedInputs && r.skippedInputs.length)
+      ? `<div class="warn" style="margin-top:8px">Skipped ${r.skippedInputs.length}:<br>${
+          r.skippedInputs.map((s) => `&bull; ${s.file} <em>(${s.reason})</em>`).join('<br>')
+        }</div>` : '';
+
+    this.$('sp-result').innerHTML = `
+      <strong>Split complete:</strong> ${out.length} part${out.length === 1 ? '' : 's'}, ${totalGB} GB total.
+      <ul style="margin-top:6px;padding-left:18px">${list}</ul>
+      ${skip}
+      ${revealBtn}
+    `;
+  },
+
+  async cancelSplit() {
+    await electronAPI.dashcamCancel();
+  },
+
+  init() {
+    this.$('sp-add-files').addEventListener('click', () => this.pickFiles());
+    this.$('sp-clear-files').addEventListener('click', () => this.clearFiles());
+    this.$('sp-pick-output').addEventListener('click', () => this.pickOutput());
+    this.$('sp-start').addEventListener('click', () => this.startSplit());
+    this.$('sp-cancel').addEventListener('click', () => this.cancelSplit());
+
+    // Listen ONLY to splitter-tagged events (phase:split or terminal cancelled/error)
+    electronAPI.onDashcamProgress((p) => {
+      if (p.phase !== 'split' && p.phase !== 'cancelled' && p.phase !== 'error') return;
+
+      const bar = this.$('sp-progress-bar');
+      const text = this.$('sp-progress-text');
+      const eta = this.$('sp-eta');
+      const cur = this.$('sp-current-file');
+
+      if (p.phase === 'error') {
+        text.textContent = 'Error';
+        eta.textContent = '';
+        this.setInfo('stage', 'Error', false, true);
+        return;
+      }
+      if (p.phase === 'cancelled') {
+        text.textContent = 'Cancelled.';
+        eta.textContent = '';
+        this.setInfo('stage', 'Cancelled', false, true);
+        return;
+      }
+      if (p.phase !== 'split') return;
+
+      if (p.stage === 'probing') {
+        text.textContent = p.message || 'Probing...';
+        this.setInfo('stage', 'Probing');
+        this.setInfo('current', p.file || '-');
+        cur.textContent = p.file || '';
+      } else if (p.stage === 'starting') {
+        text.textContent = p.message || `Splitting ${p.file}`;
+        this.setInfo('stage', 'Splitting');
+        this.setInfo('current', p.file || '-');
+        this.setInfo('progress', '0%');
+        cur.textContent = p.file || '';
+      } else if (p.stage === 'progress') {
+        bar.style.width = (p.pct != null ? p.pct.toFixed(0) : '0') + '%';
+        text.textContent = p.message || `Splitting (${p.pct || 0}%)`;
+        eta.textContent = p.etaMs != null ? `ETA: ${this.fmtEta(p.etaMs)}` : '';
+        this.setInfo('progress', `${(p.pct || 0).toFixed(0)}%`);
+        this.setInfo('eta', p.etaMs != null ? this.fmtEta(p.etaMs) : '-');
+        this.setInfo('elapsed', p.elapsedMs != null ? this.fmtEta(p.elapsedMs) : '-');
+      } else if (p.stage === 'fileDone') {
+        cur.textContent = '';
+        text.textContent = p.message || `File done`;
+        this.setInfo('stage', `Next file (${p.fileIndex}/${p.fileTotal})`);
+        this.setInfo('progress', '-');
+        this.setInfo('eta', p.etaMs != null ? this.fmtEta(p.etaMs) : '-');
+      } else if (p.stage === 'skipped') {
+        text.textContent = p.message || `Skipped ${p.file}`;
+        this.setInfo('stage', `Skipped`, false, true);
+      } else if (p.stage === 'done') {
+        bar.style.width = '100%';
+        text.textContent = p.message || 'Done';
+        eta.textContent = '';
+        this.setInfo('stage', 'Complete', true);
+        this.setInfo('current', '-');
+        this.setInfo('progress', '100%', true);
+        this.setInfo('eta', '-');
+        const parts = p.totalParts || (this._parts || 0);
+        this.setInfo('parts', String(parts), true);
+        this.setInfo('elapsed', p.elapsedMs != null ? this.fmtEta(p.elapsedMs) : '-');
+      }
+    });
+  }
+};
+splitter.init();

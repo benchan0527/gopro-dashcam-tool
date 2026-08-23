@@ -6,6 +6,7 @@ const { spawn, exec } = require('child_process');
 
 let mainWindow;
 let activeMerger = null; // { proc, cancelled }
+let activeSplitter = null; // { proc, cancelled }
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -1006,6 +1007,23 @@ ipcMain.handle('dashcam:pick-folder', async () => {
   return { canceled: false, folder: result.filePaths[0] };
 });
 
+ipcMain.handle('dashcam:pick-split-files', async () => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    properties: ['openFile', 'multiSelections'],
+    filters: [
+      { name: 'Videos', extensions: ['mp4', 'mov', 'm4v', 'mkv', 'ts', 'm2ts', 'avi'] }
+    ],
+    title: 'Select video file(s) to split'
+  });
+  if (result.canceled || !result.filePaths.length) return { canceled: true };
+  const files = result.filePaths.map((p) => {
+    let size = 0;
+    try { size = fs.statSync(p).size; } catch (e) {}
+    return { name: require('path').basename(p), path: p, size };
+  });
+  return { canceled: false, files };
+});
+
 ipcMain.handle('dashcam:pick-output', async () => {
   const result = await dialog.showOpenDialog(mainWindow, {
     properties: ['openDirectory', 'createDirectory'],
@@ -1889,15 +1907,313 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
   }
 });
 
+// =============================================================================
+//  dashcam:split — split N large videos (no merge) into <=maxSegmentBytes /
+//  <=maxSegmentSeconds parts using `ffmpeg -c copy -f segment`. Stream-rewrite
+//  so an 800 GB file can be split into 4 × 200 GB parts without ever making
+//  intermediate copies.
+// =============================================================================
+ipcMain.handle('dashcam:split', async (event, options) => {
+  const {
+    files,
+    outputDir,
+    outputName = 'splitted',
+    maxSegmentBytes  = 256 * 1024 * 1024 * 1024,   // 256 GB
+    maxSegmentSeconds = 12 * 60 * 60               // 12 h
+  } = options || {};
+
+  if (!Array.isArray(files) || files.length === 0) {
+    return { success: false, error: 'No files to split' };
+  }
+  if (!outputDir) {
+    return { success: false, error: 'Output folder is required' };
+  }
+  if (activeMerger || activeSplitter) {
+    return { success: false, error: 'Another split/merge is already running' };
+  }
+
+  try {
+    if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
+
+    const cancelledRef = { value: false };
+    activeSplitter = { cancelled: cancelledRef };
+
+    const send = (payload) => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('dashcam:progress', payload);
+      }
+    };
+
+    const allOutputs = [];   // every produced part across all files
+    const skippedInputs = [];
+    const fileStartMs = Date.now();
+    const perFileTimings = []; // ms spent on each file split
+    let processedFiles = 0;
+
+    for (let i = 0; i < files.length; i++) {
+      if (cancelledRef.value) throw new Error('Cancelled');
+
+      const file = files[i];
+      const fileSize = (() => { try { return fs.statSync(file).size; } catch (e) { return 0; } })();
+      const ext = path.extname(file) || '.mp4';
+      const base = path.basename(file, ext);
+      // Per-file pattern: <outputName>/<originalBase>_part%03d<ext>
+      // If user supplied outputName, use it verbatim; else derive from source filename.
+      const fileBase = (outputName && files.length === 1)
+        ? outputName
+        : `${outputName || base}`;
+      const pattern = path.join(outputDir, `${fileBase}_part%03d${ext}`);
+
+      send({
+        phase: 'split',
+        stage: 'probing',
+        fileIndex: i + 1,
+        fileTotal: files.length,
+        file: path.basename(file),
+        fileSize,
+        message: `Probing ${path.basename(file)} for duration...`,
+        elapsedMs: Date.now() - fileStartMs
+      });
+
+      const probe = await ffprobeJson(file);
+      const durationSec = probe?.format?.duration ? parseFloat(probe.format.duration) : 0;
+      const probeError = !probe || !durationSec || isNaN(durationSec);
+
+      if (probeError) {
+        skippedInputs.push({
+          file: path.basename(file),
+          reason: 'unreadable / no duration (ffprobe failed)'
+        });
+        send({
+          phase: 'split',
+          stage: 'skipped',
+          fileIndex: i + 1,
+          fileTotal: files.length,
+          file: path.basename(file),
+          fileSize,
+          message: `Skipped ${path.basename(file)} (no duration)`
+        });
+        continue;
+      }
+
+      // Compute segmentTime honouring BOTH byte and duration limits.
+      // bytesLimit = ceil(size / maxSegmentBytes); timeLimit = ceil(dur / maxSec)
+      // segmentTime = (duration / segmentCount) * 0.95
+      const bytesLimit  = Math.ceil(fileSize / maxSegmentBytes);
+      const timeLimit   = Math.ceil(durationSec / maxSegmentSeconds);
+      const segmentCount = Math.max(1, bytesLimit, timeLimit);
+      const segmentTime = Math.max(1, Math.floor((durationSec / segmentCount) * 0.95));
+
+      // Estimate total wall time for ETA: ~duration / 1.2 (split is faster than concat)
+      const estPartMs = Math.ceil(durationSec * 1000 / Math.max(1, segmentCount) / 1.2);
+      perFileTimings.push(estPartMs);
+
+      send({
+        phase: 'split',
+        stage: 'starting',
+        fileIndex: i + 1,
+        fileTotal: files.length,
+        file: path.basename(file),
+        fileSize,
+        durationSec,
+        segmentCount,
+        segmentTime,
+        pattern,
+        message: `Splitting ${path.basename(file)} into ${segmentCount} parts (<= ${(maxSegmentBytes / 1024 / 1024 / 1024).toFixed(0)} GB or <= ${Math.floor(maxSegmentSeconds / 3600)} h each)...`,
+        elapsedMs: Date.now() - fileStartMs
+      });
+
+      const partStartMs = Date.now();
+      const partOutputs = [];
+
+      let splitError = null;
+      await new Promise((resolve, reject) => {
+        const proc = spawn('ffmpeg', [
+          '-y', '-nostdin', '-hide_banner', '-loglevel', 'info',
+          '-i', file,
+          '-c', 'copy',
+          '-map', '0',
+          '-f', 'segment',
+          '-segment_time', String(segmentTime),
+          '-reset_timestamps', '1',
+          pattern
+        ], { windowsHide: true });
+        let stderr = '';
+        let lastReportedSec = 0;
+        proc.stderr.on('data', (d) => {
+          const s = d.toString();
+          stderr += s;
+          // ffmpeg progress format: time=00:12:34.56  bitrate=...
+          const tMatch = s.match(/time=\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+          if (tMatch) {
+            const h = parseInt(tMatch[1], 10);
+            const m = parseInt(tMatch[2], 10);
+            const sec = parseFloat(tMatch[3]);
+            const processedSec = h * 3600 + m * 60 + sec;
+            lastReportedSec = processedSec;
+            const pct = durationSec > 0 ? Math.min(100, processedSec / durationSec * 100) : 0;
+            const etaMs = Math.max(0, (durationSec - processedSec) * 1000 / 1.2);
+            send({
+              phase: 'split',
+              stage: 'progress',
+              fileIndex: i + 1,
+              fileTotal: files.length,
+              file: path.basename(file),
+              processedSec,
+              totalSec: durationSec,
+              pct: +pct.toFixed(1),
+              etaMs,
+              elapsedMs: Date.now() - partStartMs,
+              message: `Splitting ${path.basename(file)} (${pct.toFixed(0)}%, ETA ${Math.ceil(etaMs / 1000)}s)`
+            });
+          }
+        });
+        proc.on('close', (code) => {
+          if (code === 0) resolve();
+          else {
+            // Detect moov-atom style failure: skip with reason
+            if (stderr.includes('moov atom')) {
+              resolve(); // mark as handled below
+              splitError = new Error('moov atom not found (corrupt/truncated input)');
+            } else {
+              reject(new Error(`FFmpeg split exit ${code}: ${stderr.slice(-400)}`));
+            }
+          }
+        });
+        proc.on('error', reject);
+        activeSplitter.proc = proc;
+      }).catch((err) => {
+        splitError = err;
+      });
+
+      if (splitError) {
+        const reason = splitError.message.includes('moov atom')
+          ? 'truncated/corrupt (no moov atom)'
+          : splitError.message;
+        skippedInputs.push({ file: path.basename(file), reason });
+        // Roll back any partial segments that did get written
+        const segDir = path.dirname(pattern);
+        const segBase = path.basename(pattern).replace('%03d', '');
+        const segRe = new RegExp('^' + segBase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace('\\d\\d\\d', '\\d+') + '$');
+        try {
+          for (const f of fs.readdirSync(segDir)) {
+            if (segRe.test(f)) {
+              try { fs.unlinkSync(path.join(segDir, f)); } catch (e) {}
+            }
+          }
+        } catch (e) {}
+        send({
+          phase: 'split',
+          stage: 'skipped',
+          fileIndex: i + 1,
+          fileTotal: files.length,
+          file: path.basename(file),
+          message: `Skipped ${path.basename(file)}: ${reason}`
+        });
+        continue;
+      }
+
+      // Gather the produced segment files
+      try {
+        const segDir = path.dirname(pattern);
+        const segBase = path.basename(pattern).replace('%03d', '');
+        const segRe = new RegExp('^' + segBase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace('\\d\\d\\d', '\\d+') + '$');
+        for (const f of fs.readdirSync(segDir)) {
+          if (segRe.test(f)) {
+            const p = path.join(segDir, f);
+            try {
+              const st = fs.statSync(p);
+              // Sort numerically by segment number suffix (extract trailing digits)
+              const numMatch = f.match(/_part(\d+)\.[^.]+$/);
+              const segNum = numMatch ? parseInt(numMatch[1], 10) : 0;
+              partOutputs.push({ path: p, size: st.size, segmentIndex: segNum });
+            } catch (e) {}
+          }
+        }
+      } catch (e) {}
+      partOutputs.sort((a, b) => a.segmentIndex - b.segmentIndex);
+      allOutputs.push(...partOutputs);
+
+      processedFiles++;
+      const dt = Date.now() - partStartMs;
+      // Replace estimate with actual measured time for this file -> better ETA
+      perFileTimings[perFileTimings.length - 1] = dt;
+      const avgMs = perFileTimings.reduce((a, b) => a + b, 0) / perFileTimings.length;
+      const remainingMs = avgMs * (files.length - processedFiles);
+      send({
+        phase: 'split',
+        stage: 'fileDone',
+        fileIndex: i + 1,
+        fileTotal: files.length,
+        file: path.basename(file),
+        partCount: partOutputs.length,
+        lastMs: dt,
+        etaMs: remainingMs,
+        elapsedMs: Date.now() - fileStartMs,
+        message: `Done ${path.basename(file)} -> ${partOutputs.length} part${partOutputs.length === 1 ? '' : 's'} (next ETA ${Math.ceil(remainingMs / 1000)}s)`
+      });
+    }
+
+    if (cancelledRef.value) throw new Error('Cancelled');
+
+    if (allOutputs.length === 0) {
+      const list = skippedInputs.map((s) => `\u2022 ${s.file} (${s.reason})`).join('\n');
+      throw new Error(
+        `All ${files.length} input file(s) failed:\n${list}`
+      );
+    }
+
+    send({
+      phase: 'split',
+      stage: 'done',
+      outputPaths: allOutputs,
+      totalParts: allOutputs.length,
+      totalSize: allOutputs.reduce((a, b) => a + b.size, 0),
+      processedFiles,
+      skippedCount: skippedInputs.length,
+      skippedInputs: skippedInputs.slice(),
+      elapsedMs: Date.now() - fileStartMs,
+      message: skippedInputs.length
+        ? `Split complete: ${allOutputs.length} parts (${skippedInputs.length} input(s) skipped)`
+        : `Split complete: ${allOutputs.length} parts`
+    });
+
+    return {
+      success: true,
+      outputPaths: allOutputs,
+      totalParts: allOutputs.length,
+      skippedCount: skippedInputs.length,
+      skippedInputs: skippedInputs.slice(),
+      processedFiles
+    };
+  } catch (err) {
+    const message = err && err.message ? err.message : String(err);
+    if (cancelledRef.value) {
+      send({ phase: 'cancelled', message: 'Cancelled by user' });
+      return { success: false, cancelled: true, error: 'Cancelled by user' };
+    }
+    send({ phase: 'error', error: message });
+    return { success: false, error: message };
+  } finally {
+    activeSplitter = null;
+  }
+});
+
 ipcMain.handle('dashcam:cancel', async () => {
-  if (!activeMerger) return { success: false, error: 'No active merge' };
+  if (activeSplitter && activeSplitter.proc) {
+    activeSplitter.cancelled.value = true;
+    try { activeSplitter.proc.kill('SIGTERM'); } catch (e) {}
+    try { activeSplitter.proc.kill(); } catch (e) {}
+    return { success: true, target: 'splitter' };
+  }
+  if (!activeMerger) return { success: false, error: 'No active split/merge' };
   activeMerger.cancelled.value = true;
   if (activeMerger.proc) {
     try { activeMerger.proc.kill('SIGTERM'); } catch (e) {}
     // On Windows, SIGTERM doesn't really work; use kill()
     try { activeMerger.proc.kill(); } catch (e) {}
   }
-  return { success: true };
+  return { success: true, target: 'merger' };
 });
 
 ipcMain.handle('dashcam:reveal', async (event, filePath) => {

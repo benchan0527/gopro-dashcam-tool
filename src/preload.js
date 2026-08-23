@@ -33,6 +33,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   dashcamReveal: (filePath) => ipcRenderer.invoke('dashcam:reveal', filePath),
   dashcamDetectResume: (options) => ipcRenderer.invoke('dashcam:detect-resume', options),
   dashcamDiscardResume: (options) => ipcRenderer.invoke('dashcam:discard-resume', options),
+  dashcamSplit: (options) => ipcRenderer.invoke('dashcam:split', options),
+  dashcamPickSplitFolder: () => ipcRenderer.invoke('dashcam:pick-folder'),
+  dashcamPickSplitFiles: () => ipcRenderer.invoke('dashcam:pick-split-files'),
   onDashcamProgress: (callback) => {
     ipcRenderer.on('dashcam:progress', (event, data) => callback(data));
   }

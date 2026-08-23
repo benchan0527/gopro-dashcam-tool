@@ -664,6 +664,7 @@
   <div class="tab-bar">
     <div class="tab active" data-tab="gopro">GoPro Telemetry</div>
     <div class="tab" data-tab="dashcam">Dashcam Merger</div>
+    <div class="tab" data-tab="splitter">Video Splitter</div>
   </div>
 
   <div class="tab-pane active" id="tab-gopro">
@@ -954,6 +955,103 @@
   </div>
   </div>
   <!-- end #tab-dashcam -->
+
+  <div class="tab-pane" id="tab-splitter">
+  <div class="container">
+    <h2 style="text-align:center;color:#00d4ff;margin-bottom:20px;">Video Splitter</h2>
+    <p class="hint" style="text-align:center;margin-bottom:18px">
+      Splits large video files into smaller parts - perfect for files exceeding 256&nbsp;GB or 12&nbsp;h.
+      Stream-rewrite uses <code>-c copy</code>; no re-encode, no intermediate files.
+    </p>
+
+    <div class="card">
+      <h3>1. Source file(s)</h3>
+      <div class="merge-controls">
+        <input type="text" id="sp-files-display" placeholder="No files selected..." readonly>
+        <button class="btn btn-secondary" id="sp-add-files">Add files...</button>
+        <button class="btn btn-secondary" id="sp-clear-files" disabled>Clear</button>
+      </div>
+      <div id="sp-files-list" class="file-list" style="margin-top:8px"></div>
+      <div id="sp-files-summary" class="hint"></div>
+    </div>
+
+    <div class="card">
+      <h3>2. Output</h3>
+      <div class="merge-controls">
+        <input type="text" id="sp-output-folder" placeholder="Output folder..." readonly>
+        <button class="btn btn-secondary" id="sp-pick-output">Browse...</button>
+      </div>
+      <div class="merge-controls">
+        <label>Filename prefix
+          <span class="hint-inline">(per file, becomes prefix_part001.mp4; blank = use source filename)</span>:
+        </label>
+        <input type="text" id="sp-output-name" placeholder="(optional, defaults to source filename)">
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>3. Split limits</h3>
+      <div class="merge-controls">
+        <label>
+          Max file size:
+          <input type="number" id="sp-max-gb" value="256" min="1" max="1000" style="width:70px"> GB
+        </label>
+        <label style="margin-left:14px">
+          Max duration:
+          <input type="number" id="sp-max-hours" value="12" min="1" max="48" style="width:60px"> hours
+        </label>
+      </div>
+      <div class="hint">A file will be split into however many parts are needed so that no part exceeds either limit.</div>
+    </div>
+
+    <div class="card">
+      <h3>4. Run</h3>
+      <button class="btn btn-primary" id="sp-start" disabled>Start Split</button>
+      <button class="btn btn-secondary" id="sp-cancel" disabled>Cancel</button>
+
+      <div class="merge-progress" id="sp-progress" style="margin-top:18px">
+        <div class="progress-bar-container">
+          <div class="progress-bar" id="sp-progress-bar"></div>
+        </div>
+        <div class="progress-text" id="sp-progress-text">Ready</div>
+        <div id="sp-eta" class="hint" style="margin-top:6px"></div>
+        <div id="sp-current-file" class="hint"></div>
+      </div>
+
+      <div id="sp-info-panel" class="info-panel">
+        <div class="info-row">
+          <div class="info-cell">
+            <div class="info-label">Stage</div>
+            <div class="info-value" id="sp-info-stage">Idle</div>
+          </div>
+          <div class="info-cell">
+            <div class="info-label">File</div>
+            <div class="info-value" id="sp-info-current">-</div>
+          </div>
+          <div class="info-cell">
+            <div class="info-label">Progress</div>
+            <div class="info-value" id="sp-info-progress">-</div>
+          </div>
+          <div class="info-cell">
+            <div class="info-label">Parts made</div>
+            <div class="info-value" id="sp-info-parts">0</div>
+          </div>
+          <div class="info-cell">
+            <div class="info-label">ETA</div>
+            <div class="info-value" id="sp-info-eta">-</div>
+          </div>
+          <div class="info-cell">
+            <div class="info-label">Elapsed</div>
+            <div class="info-value" id="sp-info-elapsed">-</div>
+          </div>
+        </div>
+      </div>
+
+      <div id="sp-result" class="result-box" style="display:none"></div>
+    </div>
+  </div>
+  </div>
+  <!-- end #tab-splitter -->
 
   <script src="renderer.js"></script>
   <script>
