@@ -1433,6 +1433,7 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
 
   const tsFiles = [];
   const tsTimings = []; // ms per TS conversion, for ETA
+  const skippedInputs = []; // {file, reason} entries for files that failed MP4→TS
   let totalConcatSeconds = 0;
   let concatElapsedMs = 0;
   let concatStartMs = 0;
@@ -1572,6 +1573,7 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
         message: `Converting ${path.basename(file)} -> TS (${workingDirSource})`
       });
 
+      let convertError = null;
       await new Promise((resolve, reject) => {
         const proc = spawn('ffmpeg', [
           '-y', '-nostdin', '-hide_banner', '-loglevel', 'error',
@@ -1590,7 +1592,32 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
         });
         proc.on('error', reject);
         activeMerger.proc = proc;
+      }).catch((err) => {
+        // Input file is unreadable / truncated (e.g. missing moov atom from a
+        // crashed recording). Skip it instead of aborting the whole merge.
+        convertError = err;
       });
+
+      if (convertError) {
+        const reason = convertError.message.includes('moov atom')
+          ? 'truncated/corrupt (no moov atom)'
+          : convertError.message;
+        skippedInputs.push({ file: path.basename(file), reason });
+        // Roll back the .ts entry so concat ignores this slot
+        tsFiles.pop();
+        try { fs.unlinkSync(tsFile); } catch (e) {}
+        send({
+          phase: 'convert',
+          stage: 'skipped',
+          tsIndex: i + 1,
+          tsTotal: files.length,
+          file: path.basename(file),
+          fileSize,
+          message: `Skipped ${path.basename(file)}: ${reason}`
+        });
+        continue;
+      }
+
       const dt = Date.now() - t0;
       tsTimings.push(dt);
       tsFilesDone = i + 1;
@@ -1618,6 +1645,13 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
     phase1Ms = Date.now() - phase1StartMs;
 
     if (cancelledRef.value) throw new Error('Cancelled');
+
+    if (tsFiles.length === 0) {
+      const list = skippedInputs.map((s) => `• ${s.file} (${s.reason})`).join('\n');
+      throw new Error(
+        `All ${files.length} input file(s) failed MP4 → TS conversion:\n${list}`
+      );
+    }
 
     // ===== Write filelist (paths quoted to handle spaces) =====
     const listContent = tsFiles
@@ -1794,9 +1828,15 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
       phase1Ms,
       phase2Ms: concatElapsedMs,
       avgSpeedMBps: +(totalFinalBytes / 1024 / 1024 / ((phase1Ms + concatElapsedMs) / 1000)).toFixed(1),
+      skippedInputs: skippedInputs.slice(),     // [{file, reason}] of corrupt inputs skipped
+      skippedCount: skippedInputs.length,
       message: needsSplit
-        ? `Merge complete: ${finalOutputs.length} parts, total ${(totalFinalBytes / 1024 / 1024 / 1024).toFixed(2)} GB`
-        : 'Merge complete'
+        ? (skippedInputs.length
+            ? `Merge complete: ${finalOutputs.length} parts (${(totalFinalBytes / 1024 / 1024 / 1024).toFixed(2)} GB) — ${skippedInputs.length} input file(s) skipped (corrupt/truncated)`
+            : `Merge complete: ${finalOutputs.length} parts, total ${(totalFinalBytes / 1024 / 1024 / 1024).toFixed(2)} GB`)
+        : (skippedInputs.length
+            ? `Merge complete (${(totalFinalBytes / 1024 / 1024 / 1024).toFixed(2)} GB) — ${skippedInputs.length} input file(s) skipped (corrupt/truncated)`
+            : 'Merge complete')
     });
 
     return {
@@ -1805,7 +1845,9 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
       outputPaths: finalOutputs,
       size: totalFinalBytes,
       split: needsSplit,
-      segmentCount: finalOutputs.length
+      segmentCount: finalOutputs.length,
+      skippedCount: skippedInputs.length,
+      skippedInputs: skippedInputs.slice()
     };
   } catch (err) {
     stopStatsTimer();

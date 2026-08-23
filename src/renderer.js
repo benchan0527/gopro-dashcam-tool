@@ -1221,9 +1221,13 @@ const dc = {
         text.textContent = p.message || `Converting ${p.tsIndex}/${p.tsTotal}`;
         eta.textContent = (p.etaMs != null) ? `ETA: ${this.fmtEta(p.etaMs)}` : '';
 
-        this.setInfo('stage', p.stage === 'done'
-          ? `Converting  ·  ${p.tsIndex}/${p.tsTotal}`
-          : 'Converting');
+        if (p.stage === 'skipped') {
+          this.setInfo('stage', `Skipped ${p.tsIndex}/${p.tsTotal} (corrupt)`, false, true);
+        } else {
+          this.setInfo('stage', p.stage === 'done'
+            ? `Converting  ·  ${p.tsIndex}/${p.tsTotal}`
+            : 'Converting');
+        }
         this.setInfo('current', p.file || '-');
         this.setInfo('progress', `${p.tsIndex}/${p.tsTotal} files`);
         this.setInfo('speed', p.mbPerSec != null ? `${p.mbPerSec} MB/s` : '-');
@@ -1303,9 +1307,14 @@ const dc = {
         if (p.ffmpegFps) this.setInfo('fps', p.ffmpegFps);
       } else if (p.phase === 'done') {
         bar.style.width = '100%';
-        text.textContent = `Done — ${this.fmtBytes(p.size)}, phase1 ${this.fmtEta(p.phase1Ms)}, phase2 ${this.fmtEta(p.phase2Ms)}`;
+        let doneMsg = `Done — ${this.fmtBytes(p.size)}, phase1 ${this.fmtEta(p.phase1Ms)}, phase2 ${this.fmtEta(p.phase2Ms)}`;
+        if (p.skippedCount > 0) {
+          const names = (p.skippedInputs || []).map((s) => s.file).join(', ');
+          doneMsg += ` — ${p.skippedCount} skipped (corrupt): ${names}`;
+        }
+        text.textContent = doneMsg;
         eta.textContent = '';
-        this.setInfo('stage', 'Complete', true);
+        this.setInfo('stage', p.skippedCount > 0 ? 'Complete (with skips)' : 'Complete', true);
         this.setInfo('current', '-');
         this.setInfo('progress', '100%', true);
         this.setInfo('speed', p.avgSpeedMBps != null ? `${p.avgSpeedMBps} MB/s avg` : '-');
