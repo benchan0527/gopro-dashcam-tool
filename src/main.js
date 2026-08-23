@@ -1437,6 +1437,7 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
   let concatElapsedMs = 0;
   let concatStartMs = 0;
   let phase1StartMs = 0;
+  let phase1Ms = 0;            // total Phase 1 wall time; 0 on resume
   let currentFileStartMs = 0;
 
   const formatHMS = (sec) => {
@@ -1524,6 +1525,7 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
       // are all already computed from the saved snapshot.
 
       phase1StartMs = Date.now();  // virtual phase1 time for elapsed display
+      phase1Ms = 0;                // skipped on resume; report 0 so phase1 ETA shows 0:00
       send({
         phase: 'convert',
         stage: 'skipped',
@@ -1613,7 +1615,7 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
         message: `Converted ${i + 1}/${files.length} (${mbPerSec.toFixed(1)} MB/s, ETA ${Math.ceil(remaining / 1000)}s)`
       });
     }
-    const phase1Ms = Date.now() - phase1StartMs;
+    phase1Ms = Date.now() - phase1StartMs;
 
     if (cancelledRef.value) throw new Error('Cancelled');
 
