@@ -1,0 +1,957 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GoPro Telemetry & Video Merger</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+      min-height: 100vh;
+      color: #eee;
+    }
+    
+    .container {
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+    
+    h1 {
+      text-align: center;
+      margin-bottom: 20px;
+      color: #00d4ff;
+      font-size: 1.8rem;
+    }
+
+    /* ===== Tabs ===== */
+    .tab-bar {
+      display: flex;
+      gap: 4px;
+      justify-content: center;
+      margin-bottom: 24px;
+      border-bottom: 1px solid #2a3a5a;
+      padding-bottom: 0;
+    }
+    .tab {
+      padding: 10px 22px;
+      cursor: pointer;
+      background: transparent;
+      color: #8899aa;
+      border: 1px solid transparent;
+      border-bottom: none;
+      border-radius: 8px 8px 0 0;
+      font-size: 0.95rem;
+      transition: all 0.15s ease;
+      user-select: none;
+    }
+    .tab:hover { color: #cce; background: rgba(0, 212, 255, 0.06); }
+    .tab.active {
+      background: linear-gradient(180deg, rgba(0, 212, 255, 0.18), rgba(0, 212, 255, 0.04));
+      color: #00d4ff;
+      border-color: #2a3a5a;
+      border-bottom-color: transparent;
+      margin-bottom: -1px;
+    }
+    .tab-pane { display: none; }
+    .tab-pane.active { display: block; }
+
+    /* ===== Dashcam UI ===== */
+    .card {
+      background: rgba(255,255,255,0.03);
+      border: 1px solid #2a3a5a;
+      border-radius: 10px;
+      padding: 18px 20px;
+      margin-bottom: 16px;
+    }
+    .card h3 {
+      color: #00d4ff;
+      font-size: 1.05rem;
+      margin-bottom: 12px;
+      font-weight: 600;
+    }
+    .hint {
+      color: #8899aa;
+      font-size: 0.85rem;
+      margin-top: 6px;
+    }
+    .hint-inline {
+      color: #8899aa;
+      font-size: 0.8rem;
+      font-weight: normal;
+      margin-left: 4px;
+    }
+    .merge-controls {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 8px;
+    }
+    .merge-controls label { color: #cce; }
+    .merge-controls input[type="text"],
+    .merge-controls select {
+      background: #0f1729;
+      color: #eee;
+      border: 1px solid #2a3a5a;
+      border-radius: 6px;
+      padding: 7px 10px;
+      font-size: 0.9rem;
+      flex: 1 1 200px;
+      min-width: 0;
+    }
+    .file-list-wrap {
+      max-height: 320px;
+      overflow-y: auto;
+      border: 1px solid #2a3a5a;
+      border-radius: 6px;
+      margin-top: 8px;
+      background: #0a1224;
+    }
+    .file-list-header {
+      display: flex;
+      gap: 10px;
+      padding: 8px 10px;
+      background: rgba(0, 212, 255, 0.07);
+      color: #8899aa;
+      font-size: 0.8rem;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      position: sticky;
+      top: 0;
+      z-index: 1;
+    }
+    .file-list { padding: 4px 0; }
+    .file-row {
+      display: flex;
+      gap: 10px;
+      padding: 6px 10px;
+      align-items: center;
+      border-bottom: 1px solid #1a253a;
+      transition: background 0.1s;
+    }
+    .file-row:hover { background: rgba(0, 212, 255, 0.06); }
+    .file-row.selected { background: rgba(0, 255, 136, 0.05); }
+    .file-row input[type="checkbox"] {
+      flex: 0 0 32px;
+      transform: scale(1.15);
+      cursor: pointer;
+    }
+    .file-row .fname {
+      flex: 1 1 auto;
+      font-family: 'Consolas', 'Monaco', monospace;
+      font-size: 0.85rem;
+      color: #cce;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .file-row .fsize,
+    .file-row .fdur,
+    .file-row .fcodec {
+      flex: 0 0 90px;
+      text-align: right;
+      font-size: 0.8rem;
+      color: #8899aa;
+      font-family: 'Consolas', 'Monaco', monospace;
+    }
+    .file-row .fdate {
+      flex: 0 0 140px;
+      text-align: left;
+      font-size: 0.78rem;
+      color: #a8c5dd;
+      font-family: 'Consolas', 'Monaco', monospace;
+    }
+    .file-row .fdur,
+    .file-row .fcodec { flex: 0 0 80px; text-align: left; }
+    .result-box {
+      margin-top: 14px;
+      padding: 14px;
+      border-radius: 8px;
+      background: rgba(0, 255, 136, 0.08);
+      border: 1px solid rgba(0, 255, 136, 0.3);
+      color: #cce;
+      font-size: 0.9rem;
+    }
+    .result-box.error {
+      background: rgba(255, 80, 80, 0.08);
+      border-color: rgba(255, 80, 80, 0.4);
+    }
+    .result-box button { margin-top: 10px; }
+
+    /* ===== Info panel (live metrics during merge) ===== */
+    .info-panel {
+      display: grid;
+      gap: 8px;
+      margin-top: 14px;
+      padding: 12px;
+      background: rgba(0, 212, 255, 0.04);
+      border: 1px solid #2a3a5a;
+      border-radius: 8px;
+    }
+    .info-panel:empty { display: none; }
+    .info-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 8px;
+    }
+    .info-cell {
+      background: #0a1224;
+      border: 1px solid #1a253a;
+      border-radius: 6px;
+      padding: 8px 10px;
+      min-width: 0;
+    }
+    .info-label {
+      font-size: 0.7rem;
+      color: #8899aa;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      margin-bottom: 4px;
+    }
+    .info-value {
+      color: #cce;
+      font-size: 0.95rem;
+      font-weight: 600;
+      word-break: break-all;
+    }
+    .info-value.mono {
+      font-family: 'Consolas', 'Monaco', monospace;
+      font-size: 0.82rem;
+      font-weight: 500;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .info-value.highlight { color: #00ff88; }
+    .info-value.warn { color: #ffaa44; }
+    
+    .drop-zone {
+      border: 3px dashed #00d4ff;
+      border-radius: 15px;
+      padding: 50px 20px;
+      text-align: center;
+      cursor: pointer;
+      transition: all 0.3s ease;
+      background: rgba(0, 212, 255, 0.05);
+      margin-bottom: 20px;
+    }
+    
+    .drop-zone:hover, .drop-zone.dragover {
+      background: rgba(0, 212, 255, 0.15);
+      border-color: #00ff88;
+      transform: scale(1.02);
+    }
+    
+    .drop-zone-icon {
+      font-size: 48px;
+      margin-bottom: 15px;
+    }
+    
+    .drop-zone-text {
+      font-size: 1.2rem;
+      color: #aaa;
+    }
+    
+    .drop-zone-hint {
+      font-size: 0.9rem;
+      color: #666;
+      margin-top: 10px;
+    }
+    
+    .selected-files {
+      margin-bottom: 20px;
+    }
+    
+    .file-list {
+      background: rgba(255, 255, 255, 0.05);
+      border-radius: 10px;
+      padding: 15px;
+      margin-bottom: 15px;
+    }
+    
+    .file-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 10px;
+      background: rgba(0, 0, 0, 0.2);
+      border-radius: 5px;
+      margin-bottom: 8px;
+      cursor: grab;
+    }
+    
+    .file-item.dragging {
+      opacity: 0.5;
+      cursor: grabbing;
+    }
+    
+    .drag-handle {
+      cursor: grab;
+      padding: 0 8px 0 4px;
+      color: #888;
+      font-size: 14px;
+    }
+    
+    .drag-handle:hover {
+      color: #4CAF50;
+    }
+    
+    .file-number {
+      font-weight: bold;
+      color: #4CAF50;
+      min-width: 24px;
+    }
+    
+    .file-name {
+      color: #00d4ff;
+    }
+    
+    .file-status {
+      font-size: 0.85rem;
+      color: #888;
+    }
+    
+    .file-status.success {
+      color: #00ff88;
+    }
+    
+    .file-status.error {
+      color: #ff4444;
+    }
+    
+    .btn {
+      padding: 12px 30px;
+      font-size: 1rem;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: all 0.3s ease;
+      margin-right: 10px;
+      margin-bottom: 10px;
+      pointer-events: auto !important;
+      position: relative;
+      z-index: 1000;
+    }
+    
+    .btn-primary {
+      background: linear-gradient(135deg, #00d4ff 0%, #0099cc 100%);
+      color: #fff;
+    }
+    
+    .btn-primary:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 5px 20px rgba(0, 212, 255, 0.4);
+    }
+    
+    .btn-primary:disabled {
+      background: #444;
+      cursor: not-allowed;
+      transform: none;
+      box-shadow: none;
+    }
+    
+    .btn-secondary {
+      background: rgba(255, 255, 255, 0.1);
+      color: #fff;
+      border: 1px solid rgba(255, 255, 255, 0.2);
+    }
+    
+    .btn-secondary:hover {
+      background: rgba(255, 255, 255, 0.2);
+    }
+    
+    .progress-section {
+      margin: 20px 0;
+      display: none;
+    }
+    
+    .progress-section.active {
+      display: block;
+    }
+    
+    .progress-bar-container {
+      background: rgba(255, 255, 255, 0.1);
+      border-radius: 10px;
+      height: 20px;
+      overflow: hidden;
+    }
+    
+    .progress-bar {
+      height: 100%;
+      background: linear-gradient(90deg, #00d4ff, #00ff88);
+      width: 0%;
+      transition: width 0.3s ease;
+      border-radius: 10px;
+    }
+    
+    .progress-text {
+      text-align: center;
+      margin-top: 10px;
+      color: #aaa;
+    }
+    
+    .preview-section {
+      margin-top: 20px;
+      display: none;
+    }
+    
+    .preview-section.active {
+      display: block;
+    }
+    
+    .preview-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+    
+    .preview-title {
+      font-size: 1.1rem;
+      color: #00d4ff;
+    }
+    
+    .preview-content {
+      background: rgba(0, 0, 0, 0.3);
+      border-radius: 10px;
+      padding: 15px;
+      max-height: 300px;
+      overflow-y: auto;
+      font-family: 'Courier New', monospace;
+      font-size: 0.9rem;
+      line-height: 1.6;
+      white-space: pre-wrap;
+      color: #ccc;
+    }
+    
+    .status-message {
+      text-align: center;
+      padding: 15px;
+      border-radius: 8px;
+      margin-bottom: 15px;
+      display: none;
+    }
+    
+    .status-message.success {
+      display: block;
+      background: rgba(0, 255, 136, 0.1);
+      border: 1px solid #00ff88;
+      color: #00ff88;
+    }
+    
+    .status-message.error {
+      display: block;
+      background: rgba(255, 68, 68, 0.1);
+      border: 1px solid #ff4444;
+      color: #ff4444;
+    }
+    
+    .hidden {
+      display: none !important;
+    }
+
+    /* Merge Section Styles */
+    .merge-section {
+      background: rgba(255, 255, 255, 0.05);
+      border-radius: 15px;
+      padding: 20px;
+      margin-bottom: 20px;
+    }
+
+    .merge-section h2 {
+      color: #00d4ff;
+      margin-bottom: 15px;
+      font-size: 1.3rem;
+    }
+
+    .merge-controls {
+      margin-bottom: 15px;
+    }
+
+    .merge-controls label {
+      display: block;
+      color: #aaa;
+      margin-bottom: 5px;
+    }
+
+    .merge-controls input[type="text"] {
+      width: 60%;
+      padding: 10px;
+      border-radius: 5px;
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      background: rgba(0, 0, 0, 0.3);
+      color: #fff;
+      font-size: 0.9rem;
+    }
+
+    .checkbox-label {
+      display: flex !important;
+      align-items: center;
+      cursor: pointer;
+      color: #ccc !important;
+    }
+
+    .checkbox-label input[type="checkbox"] {
+      width: 18px;
+      height: 18px;
+      margin-right: 10px;
+      cursor: pointer;
+    }
+
+    .btn-merge {
+      background: linear-gradient(135deg, #ff6b35 0%, #f7931e 100%);
+      color: #fff;
+    }
+
+    .btn-merge:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 5px 20px rgba(255, 107, 53, 0.4);
+    }
+
+    .merge-progress {
+      margin-top: 15px;
+    }
+
+    /* ===== Resume banner ===== */
+    .resume-banner {
+      margin-top: 14px;
+      padding: 12px 14px;
+      background: linear-gradient(135deg, rgba(255, 170, 0, 0.12), rgba(255, 170, 0, 0.04));
+      border: 1px solid rgba(255, 170, 0, 0.4);
+      border-left: 3px solid #ffaa00;
+      border-radius: 6px;
+      color: #ffd699;
+    }
+    .resume-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.95rem;
+      color: #ffcc66;
+    }
+    .resume-icon { font-size: 1.2rem; }
+    .resume-summary {
+      margin-top: 8px;
+      font-size: 0.85rem;
+      color: #c8d4e0;
+      line-height: 1.5;
+      font-family: 'Courier New', monospace;
+    }
+    .resume-summary .warn { color: #ff8888; }
+    .resume-actions {
+      margin-top: 10px;
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .resume-actions button { font-size: 0.85rem; padding: 6px 12px; }
+    #dc-resume-dismiss {
+      margin-left: auto;
+      padding: 6px 10px;
+      min-width: 32px;
+    }
+
+    .merge-status {
+      margin-top: 10px;
+      padding: 10px;
+      border-radius: 5px;
+      background: rgba(0, 0, 0, 0.3);
+      font-family: 'Courier New', monospace;
+      font-size: 0.85rem;
+      color: #aaa;
+      max-height: 150px;
+      overflow-y: auto;
+    }
+
+    /* Nominatim Section */
+    .nominatim-section {
+      background: rgba(255, 255, 255, 0.05);
+      border-radius: 10px;
+      padding: 15px;
+      margin-bottom: 20px;
+    }
+
+    .nominatim-section h3 {
+      color: #00d4ff;
+      margin-bottom: 10px;
+      font-size: 1rem;
+    }
+
+    .nominatim-buttons {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+
+    .nominatim-status {
+      padding: 8px;
+      border-radius: 5px;
+      font-size: 0.85rem;
+      background: rgba(0, 0, 0, 0.3);
+    }
+
+    .nominatim-status.running { color: #00ff88; }
+    .nominatim-status.stopped { color: #ff4444; }
+    .nominatim-status.checking { color: #ffc800; }
+
+    .btn-nominatim {
+      background: linear-gradient(135deg, #00ff88, #00cc6a);
+      color: #000;
+      font-weight: bold;
+    }
+
+    .btn-nominatim:hover {
+      box-shadow: 0 4px 15px rgba(0, 255, 136, 0.4);
+    }
+
+    .srt-options {
+      margin-top: 10px;
+      padding: 10px;
+      background: rgba(255, 255, 255, 0.05);
+      border-radius: 8px;
+    }
+
+    .checkbox-label {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: #aaa;
+      cursor: pointer;
+      font-size: 0.9rem;
+    }
+
+    .checkbox-label input[type="checkbox"] {
+      width: 18px;
+      height: 18px;
+      accent-color: #00d4ff;
+    }
+
+    .btn-srt-merge {
+      background: linear-gradient(135deg, #ff6b6b, #ee5a5a);
+      color: white;
+    }
+
+    .btn-srt-merge:hover {
+      box-shadow: 0 4px 15px rgba(255, 107, 107, 0.4);
+    }
+
+    .nominatim-console {
+      margin-top: 10px;
+      padding: 10px;
+      background: rgba(0, 0, 0, 0.4);
+      border-radius: 5px;
+      font-family: 'Courier New', monospace;
+      font-size: 0.75rem;
+      color: #aaa;
+      max-height: 200px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      overflow-wrap: break-word;
+    }
+
+  </style>
+</head>
+<body>
+  <h1>GoPro Telemetry & Video Merger</h1>
+  <div class="tab-bar">
+    <div class="tab active" data-tab="gopro">GoPro Telemetry</div>
+    <div class="tab" data-tab="dashcam">Dashcam Merger</div>
+  </div>
+
+  <div class="tab-pane active" id="tab-gopro">
+  <div class="container">
+    <h1>GoPro Telemetry & Video Merger</h1>
+
+    <!-- Nominatim Section -->
+    <div class="nominatim-section">
+      <h3>Nominatim Server</h3>
+      <div class="nominatim-buttons">
+        <button class="btn btn-nominatim" id="startNominatimBtn">Start</button>
+        <button class="btn btn-secondary" id="stopNominatimBtn" disabled>Stop</button>
+        <button class="btn btn-secondary" id="checkNominatimBtn">Check</button>
+        <button class="btn btn-secondary" id="viewLogsBtn">View Logs</button>
+      </div>
+      <div class="nominatim-status" id="nominatimStatus">Not running</div>
+      <div class="nominatim-console" id="nominatimConsole"></div>
+    </div>
+
+    <div id="dropZone" class="drop-zone">
+      <div class="drop-zone-icon">📹</div>
+      <div class="drop-zone-text">Drag & Drop GoPro MP4/LRV files here</div>
+      <div class="drop-zone-hint">or click to browse</div>
+    </div>
+    
+    <div class="selected-files hidden" id="selectedFiles">
+      <div class="file-list" id="fileList"></div>
+      <button class="btn btn-primary" id="processBtn">Process Files</button>
+      <button class="btn btn-secondary" id="clearBtn">Clear</button>
+      <button class="btn btn-secondary" id="sortByDateBtn">Sort by Date (Earliest First)</button>
+      <button class="btn btn-merge" id="mergeBtn">Fast Merge Videos</button>
+      <button class="btn btn-srt-merge" id="mergeSRTOnlyBtn">Merge SRT Only</button>
+      <div class="srt-options">
+        <label class="checkbox-label">
+          <input type="checkbox" id="mergeSRT">
+          Merge multiple SRT files (sort by MP4 date - earliest first)
+        </label>
+      </div>
+    </div>
+
+    <div class="merge-section" id="mergeSection">
+      <h2>Fast Merge</h2>
+      <div class="merge-controls">
+        <label>Output Directory:</label>
+        <input type="text" id="outputDir" placeholder="Select output directory..." readonly>
+        <button class="btn btn-secondary" id="selectOutputBtn">Browse</button>
+      </div>
+      <div class="merge-controls">
+        <label class="checkbox-label">
+          <input type="checkbox" id="sortByDate" checked>
+          Sort videos by date (earliest first)
+        </label>
+      </div>
+      <div class="merge-controls">
+        <label class="checkbox-label">
+          <input type="checkbox" id="addSubtitles" checked>
+          Add GPS subtitles to merged video
+        </label>
+      </div>
+      <button class="btn btn-primary" id="startMergeBtn" disabled>Start Merge</button>
+      <div class="merge-progress" id="mergeProgress">
+        <div class="progress-bar-container">
+          <div class="progress-bar" id="mergeProgressBar"></div>
+        </div>
+        <div class="progress-text" id="mergeProgressText">Ready to merge...</div>
+      </div>
+      <div class="merge-status" id="mergeStatus"></div>
+    </div>
+    
+    <div class="progress-section" id="progressSection">
+      <div class="progress-bar-container">
+        <div class="progress-bar" id="progressBar"></div>
+      </div>
+      <div class="progress-text" id="progressText">Processing...</div>
+    </div>
+    
+    <div class="status-message" id="statusMessage"></div>
+    
+    <div class="preview-section" id="previewSection">
+      <div class="preview-header">
+        <span class="preview-title">SRT Preview</span>
+        <div>
+          <button class="btn btn-secondary" id="copyBtn">Copy</button>
+          <button class="btn btn-primary" id="saveBtn">Save SRT</button>
+        </div>
+      </div>
+      <div class="preview-content" id="previewContent"></div>
+    </div>
+  </div>
+  </div>
+  <!-- end #tab-gopro -->
+
+  <div class="tab-pane" id="tab-dashcam">
+  <div class="container">
+    <h2 style="text-align:center;color:#00d4ff;margin-bottom:20px;">Dashcam Video Merger</h2>
+
+    <div class="card">
+      <h3>1. Source folder</h3>
+      <div class="merge-controls">
+        <input type="text" id="dc-source-folder" placeholder="Choose a folder with .mp4 files..." readonly>
+        <button class="btn btn-secondary" id="dc-pick-folder">Browse...</button>
+        <button class="btn btn-primary" id="dc-rescan" disabled>Rescan</button>
+      </div>
+      <div id="dc-folder-summary" class="hint"></div>
+    </div>
+
+    <div class="card">
+      <h3>2. Sort &amp; select</h3>
+      <div class="merge-controls">
+        <label>Sort by:</label>
+        <select id="dc-sort">
+          <option value="name-asc">Filename (A→Z) — default for dashcams with embedded timestamp</option>
+          <option value="name-desc">Filename (Z→A)</option>
+          <option value="date-asc">Recording date (oldest first)</option>
+          <option value="date-desc">Recording date (newest first)</option>
+          <option value="size-asc">File size (small→large)</option>
+          <option value="size-desc">File size (large→small)</option>
+          <option value="mtime-asc">File modified time (oldest first)</option>
+          <option value="mtime-desc">File modified time (newest first)</option>
+        </select>
+        <button class="btn btn-secondary" id="dc-sort-apply">Apply</button>
+        <button class="btn btn-secondary" id="dc-sel-all">Select all</button>
+        <button class="btn btn-secondary" id="dc-sel-none">None</button>
+        <button class="btn btn-secondary" id="dc-sel-invert">Invert</button>
+      </div>
+      <div id="dc-file-list-wrap" class="file-list-wrap">
+        <div class="file-list-header">
+          <span style="flex:0 0 32px"></span>
+          <span style="flex:1 1 auto">Filename</span>
+          <span style="flex:0 0 90px;text-align:right">Size</span>
+          <span style="flex:0 0 80px;text-align:right">Duration</span>
+          <span style="flex:0 0 80px">Codec</span>
+        </div>
+        <div id="dc-file-list" class="file-list"></div>
+      </div>
+      <div id="dc-list-summary" class="hint"></div>
+    </div>
+
+    <div class="card">
+      <h3>3. Output</h3>
+      <div class="merge-controls">
+        <input type="text" id="dc-output-folder" placeholder="Output folder..." readonly>
+        <button class="btn btn-secondary" id="dc-pick-output">Browse...</button>
+      </div>
+      <div class="merge-controls">
+        <label>Filename:</label>
+        <input type="text" id="dc-output-name" placeholder="dashcam_merged (auto if blank)">
+      </div>
+      <div class="merge-controls">
+        <label>Working / temp folder
+          <span class="hint-inline">(for .ts intermediates; auto-fallback if low disk)</span>:
+        </label>
+        <input type="text" id="dc-temp-folder" placeholder="(optional, defaults to output folder)">
+        <button class="btn btn-secondary" id="dc-pick-temp">Browse...</button>
+      </div>
+      <div class="merge-controls">
+        <label class="checkbox-label">
+          <input type="checkbox" id="dc-cleanup-ts" checked>
+          Clean up .ts intermediate files when done
+        </label>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>4. Run</h3>
+      <button class="btn btn-primary" id="dc-start-merge" disabled>Start Merge</button>
+      <button class="btn btn-secondary" id="dc-cancel" disabled>Cancel</button>
+
+      <!-- ===== Resume banner (shown when a previous session is detected) ===== -->
+      <div id="dc-resume-banner" class="resume-banner" style="display:none">
+        <div class="resume-header">
+          <span class="resume-icon">⏯</span>
+          <strong>Previous session detected</strong>
+        </div>
+        <div id="dc-resume-summary" class="resume-summary"></div>
+        <div id="dc-resume-actions" class="resume-actions">
+          <button class="btn btn-primary" id="dc-resume-go">▶ Resume (skip Phase 1)</button>
+          <button class="btn btn-secondary" id="dc-resume-discard">✗ Discard temp files</button>
+          <button class="btn btn-secondary" id="dc-resume-dismiss">×</button>
+        </div>
+      </div>
+
+      <div class="merge-progress" id="dc-progress" style="margin-top:18px">
+        <div class="progress-bar-container">
+          <div class="progress-bar" id="dc-progress-bar"></div>
+        </div>
+        <div class="progress-text" id="dc-progress-text">Ready</div>
+        <div id="dc-eta" class="hint" style="margin-top:6px"></div>
+        <div id="dc-current-file" class="hint"></div>
+      </div>
+
+      <!-- ===== Live info panel ===== -->
+      <div id="dc-info-panel" class="info-panel">
+        <div class="info-row">
+          <div class="info-cell">
+            <div class="info-label">Stage</div>
+            <div class="info-value" id="dc-info-stage">Idle</div>
+          </div>
+          <div class="info-cell">
+            <div class="info-label">Current file</div>
+            <div class="info-value mono" id="dc-info-current">-</div>
+          </div>
+          <div class="info-cell">
+            <div class="info-label">Progress</div>
+            <div class="info-value" id="dc-info-progress">-</div>
+          </div>
+        </div>
+
+        <div class="info-row">
+          <div class="info-cell">
+            <div class="info-label">Speed</div>
+            <div class="info-value" id="dc-info-speed">-</div>
+          </div>
+          <div class="info-cell">
+            <div class="info-label">Bitrate</div>
+            <div class="info-value" id="dc-info-bitrate">-</div>
+          </div>
+          <div class="info-cell">
+            <div class="info-label">FPS</div>
+            <div class="info-value" id="dc-info-fps">-</div>
+          </div>
+        </div>
+
+        <div class="info-row">
+          <div class="info-cell">
+            <div class="info-label">Phase 1 ETA</div>
+            <div class="info-value" id="dc-info-eta1">-</div>
+          </div>
+          <div class="info-cell">
+            <div class="info-label">Phase 2 ETA</div>
+            <div class="info-value" id="dc-info-eta2">-</div>
+          </div>
+          <div class="info-cell">
+            <div class="info-label">Elapsed</div>
+            <div class="info-value" id="dc-info-elapsed">-</div>
+          </div>
+        </div>
+
+        <div class="info-row">
+          <div class="info-cell">
+            <div class="info-label">Output size</div>
+            <div class="info-value" id="dc-info-outsize">-</div>
+          </div>
+          <div class="info-cell">
+            <div class="info-label">Input total</div>
+            <div class="info-value" id="dc-info-intotal">-</div>
+          </div>
+          <div class="info-cell">
+            <div class="info-label">Disk free</div>
+            <div class="info-value" id="dc-info-disk">-</div>
+          </div>
+        </div>
+
+        <div class="info-row">
+          <div class="info-cell">
+            <div class="info-label">CPU</div>
+            <div class="info-value" id="dc-info-cpu">-</div>
+          </div>
+          <div class="info-cell">
+            <div class="info-label">Memory</div>
+            <div class="info-value" id="dc-info-mem">-</div>
+          </div>
+          <div class="info-cell">
+            <div class="info-label">TS segments</div>
+            <div class="info-value" id="dc-info-ts">-</div>
+          </div>
+        </div>
+      </div>
+
+      <div id="dc-result" class="result-box" style="display:none"></div>
+    </div>
+  </div>
+  </div>
+  <!-- end #tab-dashcam -->
+
+  <script src="renderer.js"></script>
+  <script>
+    // Tab switching
+    document.querySelectorAll('.tab').forEach((t) => {
+      t.addEventListener('click', () => {
+        const name = t.dataset.tab;
+        document.querySelectorAll('.tab').forEach((x) => x.classList.toggle('active', x === t));
+        document.querySelectorAll('.tab-pane').forEach((p) => {
+          p.classList.toggle('active', p.id === 'tab-' + name);
+        });
+      });
+    });
+    console.log('[HTML] Page loaded');
+  </script>
+</body>
+</html>

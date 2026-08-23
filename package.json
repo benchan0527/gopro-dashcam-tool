@@ -1,0 +1,31 @@
+{
+  "name": "gopro-dashcam-tool",
+  "version": "1.0.0",
+  "description": "Merge GoPro / dashcam footage and extract GPS / G-Force / Speed telemetry as SRT subtitles",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "extract": "node extract.js",
+    "test": "node extract.js"
+  },
+  "keywords": [
+    "gopro",
+    "telemetry",
+    "gpmf",
+    "srt",
+    "subtitles",
+    "gps",
+    "g-force"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "gpmf-extract": "^0.3.2",
+    "gopro-telemetry": "^1.2.11",
+    "node-geocoder": "^4.2.0",
+    "electron": "^28.0.0"
+  },
+  "devDependencies": {
+    "electron-builder": "^24.9.1"
+  }
+}

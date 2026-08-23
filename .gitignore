@@ -1,0 +1,69 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+npm-debug.log*
+
+# ===== User data / videos (NEVER commit) =====
+input/
+output/
+merged/
+*.mp4
+*.ts
+*.mov
+*.avi
+*.mkv
+*.m4v
+
+# ===== Large dataset dumps =====
+nominatim-data/
+*.osm.pbf
+*.pbf
+
+# ===== Reference / third-party codebases =====
+gopro-telemetry-master/
+vidmerger-main/
+gopro-telemetry/
+gpmf-extract/
+plist/
+
+# ===== OSM Nominatim PHP admin (local-only) =====
+create_role.sql
+defaults.php
+hosts
+hosts2
+local.php
+nominatim-settings.php
+test_db.php
+test_settings.php
+test_settings2.php
+test_settings3.php
+settings.local.php
+
+# ===== Archives / backups =====
+*.rar
+*.zip
+*.7z
+*.tar.gz
+*.bak
+
+# ===== Temp session files (resumable state, not source) =====
+# Note: filelist_*.txt and part*.ts in output dir are runtime state, not source.
+# These patterns only matter if user data dirs aren't already excluded.
+filelist_*.txt
+part*.ts
+*.srt
+
+# ===== Local environment =====
+.env
+.env.local
