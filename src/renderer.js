@@ -1055,7 +1055,9 @@ const dc = {
       </div>
       <div><span class="hint-inline">Output:</span> ${outName}
         ≈ ${state.estimatedFinalGB} GB
-        ${needsSplit ? `→ ${segmentCount} parts` : ''}
+        ${needsSplit ? ` -> ${segmentCount} parts`
+          + ` (<= ${(state.maxSegmentBytes / 1024 / 1024 / 1024).toFixed(0)} GB`
+          + ` or <= ${Math.floor((state.maxSegmentSeconds || 43200) / 3600)} h each)` : ''}
       </div>
     `;
     if (state.partialOutputPath) {
@@ -1126,7 +1128,13 @@ const dc = {
       outputDir: outDir,
       outputName: this.$('dc-output-name').value.trim(),
       tempDir: this.$('dc-temp-folder').value.trim() || null,
-      cleanupTs: this.$('dc-cleanup-ts').checked
+      cleanupTs: this.$('dc-cleanup-ts').checked,
+      maxSegmentBytes: this.$('dc-enable-split').checked
+        ? Math.max(1, parseInt(this.$('dc-max-gb').value, 10) || 256) * 1024 * 1024 * 1024
+        : Infinity,           // effectively disable splitting
+      maxSegmentSeconds: this.$('dc-enable-split').checked
+        ? Math.max(1, parseInt(this.$('dc-max-hours').value, 10) || 12) * 3600
+        : Infinity
     };
 
     // If resume state is detected and selected file count matches, attach resumeFrom
@@ -1137,7 +1145,13 @@ const dc = {
         fileListPath: this._resumeState.fileListPath,
         tsFiles: this._resumeState.tsFiles,
         originalFinalName: this._resumeState.originalFinalName,
-        needsSplit: this._resumeState.needsSplit
+        needsSplit: this._resumeState.needsSplit,
+        // Override defaults if splitting is still enabled; otherwise let merge
+        // recompute needsSplit=false from its Infinity defaults.
+        ...(this.$('dc-enable-split').checked ? {
+          maxSegmentBytes: options.maxSegmentBytes,
+          maxSegmentSeconds: options.maxSegmentSeconds
+        } : {})
       };
       if (!options.outputName && this._resumeState.originalFinalName) {
         options.outputName = `${this._resumeState.originalFinalName}_resumed`;
@@ -1369,6 +1383,13 @@ dc.$('dc-cancel').addEventListener('click', () => dc.cancel());
 dc.$('dc-resume-go').addEventListener('click', () => dc.startMerge());
 dc.$('dc-resume-discard').addEventListener('click', () => dc.discardResume());
 dc.$('dc-resume-dismiss').addEventListener('click', () => dc.dismissResume());
+
+// Toggle split options visibility
+dc.$('dc-enable-split').addEventListener('change', (e) => {
+  dc.$('dc-split-options').style.display = e.target.checked ? '' : 'none';
+});
+// Initial visibility (checked = show options)
+dc.$('dc-split-options').style.display = dc.$('dc-enable-split').checked ? '' : 'none';
 
 // Re-detect resume state when output-name changes (cheap scan)
 dc.$('dc-output-name').addEventListener('change', () => dc.detectResume());

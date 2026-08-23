@@ -825,6 +825,22 @@
           Clean up .ts intermediate files when done
         </label>
       </div>
+      <div class="merge-controls" style="margin-top:6px">
+        <label class="checkbox-label">
+          <input type="checkbox" id="dc-enable-split" checked>
+          Auto-split into multiple files if output exceeds limits
+        </label>
+      </div>
+      <div class="merge-controls" id="dc-split-options" style="margin-left:22px;margin-top:4px">
+        <label>
+          Max file size:
+          <input type="number" id="dc-max-gb" value="256" min="1" max="1000" style="width:70px"> GB
+        </label>
+        <label style="margin-left:14px">
+          Max duration:
+          <input type="number" id="dc-max-hours" value="12" min="1" max="48" style="width:60px"> hours
+        </label>
+      </div>
     </div>
 
     <div class="card">

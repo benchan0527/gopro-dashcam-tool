@@ -1147,6 +1147,8 @@ ipcMain.handle('dashcam:detect-resume', async (event, { outputDir, outputName })
       tsBytes,
       tsGB: +(tsBytes / 1024 / 1024 / 1024).toFixed(2),
       estimatedFinalGB: +(estimatedFinalBytes / 1024 / 1024 / 1024).toFixed(2),
+      maxSegmentBytes: 256 * 1024 * 1024 * 1024,
+      maxSegmentSeconds: 12 * 60 * 60,
       needsSplit,
       segmentCount,
       partialOutputPath,
@@ -1197,7 +1199,8 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
     tempDir = null,    // if null, uses outputDir
     cleanupTs = true,
     maxSegmentBytes = 256 * 1024 * 1024 * 1024,  // 256 GB per output
-    resumeFrom = null  // { fileListPath, tsFiles, outputName, needsSplit, segmentTime, estimatedFinalBytes, totalInputBytes, totalInputSeconds } | null
+    maxSegmentSeconds = 12 * 60 * 60,           // 12 hours per output
+    resumeFrom = null  // { fileListPath, tsFiles, outputName, needsSplit, segmentTime, estimatedFinalBytes, totalInputBytes, totalInputSeconds, maxSegmentBytes, maxSegmentSeconds } | null
   } = options;
 
   if (!Array.isArray(files) || files.length === 0) {
@@ -1242,11 +1245,13 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
   // Estimated final output size: concat is -c copy, so ~93% of input size
   // (TS rewrap is slightly smaller than MP4 due to removing MP4 container overhead).
   const estimatedFinalBytes = Math.ceil(totalInputBytes * 0.93);
-  const needsSplit = estimatedFinalBytes > maxSegmentBytes;
-  const segmentCount = needsSplit ? Math.ceil(estimatedFinalBytes / maxSegmentBytes) : 1;
-  // segment_time (sec): portion of total duration for each segment, ensuring
-  // each output ≤ maxSegmentBytes. We use 95% to add safety margin against
-  // variable bitrate — worst-case segment may slightly exceed maxSegmentBytes.
+  // Split if EITHER limit is exceeded; take the larger of the two segment counts.
+  const bytesLimit   = Math.ceil(estimatedFinalBytes / maxSegmentBytes);
+  const timeLimit    = Math.ceil(totalInputSeconds / maxSegmentSeconds);
+  const segmentCount = Math.max(bytesLimit, timeLimit);
+  const needsSplit   = segmentCount > 1;
+  // segment_time (sec): use the more restrictive time-based split to honour both limits.
+  // 95% safety margin to guard against variable bitrate / rounding errors.
   const segmentTime = needsSplit
     ? Math.floor((totalInputSeconds / segmentCount) * 0.95)
     : 0;
@@ -1279,14 +1284,17 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
     workingDirSource = 'resumed session (TS folder)';
     sendPreflight({
       phase: 'preflight',
-      message: `Resuming — using existing ${resumeFrom.tsFiles.length} TS segments in ${workingDir}`,
+      message: `Resuming - using existing ${resumeFrom.tsFiles.length} TS segments in ${workingDir}` +
+        (needsSplit ? ` (will split into ${segmentCount} parts <= ${(maxSegmentBytes / 1024 / 1024 / 1024).toFixed(0)} GB or <= ${Math.floor(maxSegmentSeconds / 3600)} h each)` : ''),
       tempDir: workingDir,
       tempDirSource: workingDirSource,
       resuming: true,
       tsReady: resumeFrom.tsFiles.length,
       needsSplit,
       segmentCount,
-      estimatedFinalGB: +(estimatedFinalBytes / 1024 / 1024 / 1024).toFixed(2)
+      estimatedFinalGB: +(estimatedFinalBytes / 1024 / 1024 / 1024).toFixed(2),
+      maxSegmentBytes,
+      maxSegmentSeconds
     });
   } else {
     for (const c of candidates) {
@@ -1307,14 +1315,16 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
           workingDirSource = c.source;
           sendPreflight({
             phase: 'preflight',
-            message: `Disk OK on ${c.source} (${freeGB} GB free, need ~${(requiredBytes / 1024 / 1024 / 1024).toFixed(2)} GB${needsSplit ? `, will split into ${segmentCount} parts` : ''})`,
+            message: `Disk OK on ${c.source} (${freeGB} GB free, need ~${(requiredBytes / 1024 / 1024 / 1024).toFixed(2)} GB${needsSplit ? `, will split into ${segmentCount} parts (<= ${(maxSegmentBytes / 1024 / 1024 / 1024).toFixed(0)} GB or <= ${Math.floor(maxSegmentSeconds / 3600)} h each)` : ''})`,
             tempDir: workingDir,
             tempDirSource: workingDirSource,
             diskFreeBytes: freeBytes,
             requiredBytes,
             needsSplit,
             segmentCount,
-            estimatedFinalGB: +(estimatedFinalBytes / 1024 / 1024 / 1024).toFixed(2)
+            estimatedFinalGB: +(estimatedFinalBytes / 1024 / 1024 / 1024).toFixed(2),
+            maxSegmentBytes,
+            maxSegmentSeconds
           });
           break;
         } else {
@@ -1669,7 +1679,7 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
       segmentCount,
       totalSeconds: totalInputSeconds,
       message: needsSplit
-        ? `Concatenating ${tsFiles.length} TS segments → ${segmentCount} parts (≤ ${(maxSegmentBytes / 1024 / 1024 / 1024).toFixed(0)} GB each)...`
+        ? `Concatenating ${tsFiles.length} TS segments -> ${segmentCount} parts (<= ${(maxSegmentBytes / 1024 / 1024 / 1024).toFixed(0)} GB or <= ${Math.floor(maxSegmentSeconds / 3600)} h each)...`
         : `Concatenating ${tsFiles.length} TS segments...`
     });
 
