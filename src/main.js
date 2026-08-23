@@ -1469,6 +1469,17 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
   let phase1Ms = 0;            // total Phase 1 wall time; 0 on resume
   let currentFileStartMs = 0;
 
+  // Cross-phase overall progress: phase 1 (sum of input MP4s) + phase 2 (sum of TS concat output).
+  // Tracked as bytes on each event so the renderer can show a single Combined progress
+  // bar across both phases. Weighted 1:1 because phase 1 ≈ input bytes and phase 2
+  // is roughly 0.93× of phase 1 (TS rewrap), so the overall ratio is reasonable.
+  const phase1TotalBytes = totalInputBytes;     // sum of selected MP4s
+  const phase2TotalBytes = estimatedFinalBytes; // concat output
+  const overallTotalBytes = phase1TotalBytes + phase2TotalBytes;
+  let phase1DoneBytes = 0; // bytes fully converted so far (across completed files)
+  let phase2DoneBytes = 0; // bytes fully written so far (set on phase 2 start; not updated here)
+  let skippedFilesBytes = 0; // input bytes we couldn't process (counted as "consumed")
+
   const formatHMS = (sec) => {
     sec = Math.floor(sec);
     const h = Math.floor(sec / 3600);
@@ -1555,6 +1566,8 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
 
       phase1StartMs = Date.now();  // virtual phase1 time for elapsed display
       phase1Ms = 0;                // skipped on resume; report 0 so phase1 ETA shows 0:00
+      phase1DoneBytes = phase1TotalBytes;  // already done in a previous session
+      skippedFilesBytes = 0;
       send({
         phase: 'convert',
         stage: 'skipped',
@@ -1598,6 +1611,12 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
         eta1Ms: remainingMs,
         tempDir: workingDir,
         tempDirSource: workingDirSource,
+        phase1DoneBytes,
+        phase1TotalBytes,
+        phase2DoneBytes,
+        phase2TotalBytes,
+        overallTotalBytes,
+        overallDoneBytes: phase1DoneBytes + phase2DoneBytes,
         message: `Converting ${path.basename(file)} -> TS (${workingDirSource})`
       });
 
@@ -1634,6 +1653,9 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
         // Roll back the .ts entry so concat ignores this slot
         tsFiles.pop();
         try { fs.unlinkSync(tsFile); } catch (e) {}
+        // Count skipped file as "consumed" for overall progress
+        phase1DoneBytes += fileSize;
+        skippedFilesBytes += fileSize;
         send({
           phase: 'convert',
           stage: 'skipped',
@@ -1641,6 +1663,12 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
           tsTotal: files.length,
           file: path.basename(file),
           fileSize,
+          phase1DoneBytes,
+          phase1TotalBytes,
+          phase2DoneBytes,
+          phase2TotalBytes,
+          overallTotalBytes,
+          overallDoneBytes: phase1DoneBytes + phase2DoneBytes,
           message: `Skipped ${path.basename(file)}: ${reason}`
         });
         continue;
@@ -1649,6 +1677,7 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
       const dt = Date.now() - t0;
       tsTimings.push(dt);
       tsFilesDone = i + 1;
+      phase1DoneBytes += fileSize;
 
       const avgMs = tsTimings.reduce((a, b) => a + b, 0) / tsTimings.length;
       const remaining = avgMs * (files.length - (i + 1));
@@ -1666,6 +1695,12 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
         etaMs: remaining,
         eta1Ms: remaining,
         mbPerSec: +mbPerSec.toFixed(1),
+        phase1DoneBytes,
+        phase1TotalBytes,
+        phase2DoneBytes,
+        phase2TotalBytes,
+        overallTotalBytes,
+        overallDoneBytes: phase1DoneBytes + phase2DoneBytes,
         elapsedMs: Date.now() - phase1StartMs,
         message: `Converted ${i + 1}/${files.length} (${mbPerSec.toFixed(1)} MB/s, ETA ${Math.ceil(remaining / 1000)}s)`
       });
@@ -1689,6 +1724,9 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
     }
 
     // ===== Phase 2: Concat TS -> MP4 (or split into segments if oversized) =====
+    // Phase 1 is now done; roll remaining bytes into phase 2 denominator.
+    phase1DoneBytes = phase1TotalBytes;
+    phase2DoneBytes = 0;
     send({
       phase: 'concat',
       stage: 'starting',
@@ -1696,6 +1734,12 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
       needsSplit,
       segmentCount,
       totalSeconds: totalInputSeconds,
+      phase1DoneBytes,
+      phase1TotalBytes,
+      phase2DoneBytes,
+      phase2TotalBytes,
+      overallTotalBytes,
+      overallDoneBytes: phase1DoneBytes + phase2DoneBytes,
       message: needsSplit
         ? `Concatenating ${tsFiles.length} TS segments -> ${segmentCount} parts (<= ${(maxSegmentBytes / 1024 / 1024 / 1024).toFixed(0)} GB or <= ${Math.floor(maxSegmentSeconds / 3600)} h each)...`
         : `Concatenating ${tsFiles.length} TS segments...`
@@ -1778,6 +1822,7 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
 
           const mbPerSec = elapsed > 0 ? (currentOutputBytes / 1024 / 1024) / (elapsed / 1000) : 0;
           cachedEta2Ms = etaMs;
+          phase2DoneBytes = currentOutputBytes; // tracks phase 2 progress in bytes
           send({
             phase: 'concat',
             stage: 'progress',
@@ -1791,6 +1836,12 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
             ffmpegBitrate: currentBitrateStr,
             ffmpegFps: currentFpsStr,
             outputBytes: currentOutputBytes,
+            phase1DoneBytes,
+            phase1TotalBytes,
+            phase2DoneBytes,
+            phase2TotalBytes,
+            overallTotalBytes,
+            overallDoneBytes: phase1DoneBytes + phase2DoneBytes,
             message: totalConcatSeconds > 0
               ? `Concatenating: ${formatHMS(cur)} / ${formatHMS(totalConcatSeconds)}`
               : `Concatenating... ${(currentOutputBytes / 1024 / 1024).toFixed(0)} MB written`
@@ -1845,6 +1896,8 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
     }
 
     stopStatsTimer();
+    phase2DoneBytes = totalFinalBytes;          // phase 2 finished
+    phase1DoneBytes = phase1TotalBytes;          // ensure 100% even if resume or skip
     send({
       phase: 'done',
       success: true,
@@ -1855,6 +1908,12 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
       split: needsSplit,
       phase1Ms,
       phase2Ms: concatElapsedMs,
+      phase1DoneBytes,
+      phase1TotalBytes,
+      phase2DoneBytes,
+      phase2TotalBytes,
+      overallTotalBytes,
+      overallDoneBytes: phase1DoneBytes + phase2DoneBytes,
       avgSpeedMBps: +(totalFinalBytes / 1024 / 1024 / ((phase1Ms + concatElapsedMs) / 1000)).toFixed(1),
       skippedInputs: skippedInputs.slice(),     // [{file, reason}] of corrupt inputs skipped
       skippedCount: skippedInputs.length,

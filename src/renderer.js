@@ -1229,8 +1229,11 @@ const dc = {
           console.log('[preflight] using temp dir:', p.tempDir, '(' + p.tempDirSource + ')');
         }
       } else if (p.phase === 'convert') {
-        const pct = p.tsTotal > 0 ? Math.round(((p.tsIndex) / p.tsTotal) * 90) : 0;
-        bar.style.width = pct + '%';
+        // Use the bytes-based Overall % so the bar matches the info cells.
+        const ov = p.overallTotalBytes > 0
+          ? Math.min(100, (p.overallDoneBytes || 0) / p.overallTotalBytes * 100)
+          : 0;
+        bar.style.width = ov.toFixed(2) + '%';
         cur.textContent = p.file ? p.file : '';
         text.textContent = p.message || `Converting ${p.tsIndex}/${p.tsTotal}`;
         eta.textContent = (p.etaMs != null) ? `ETA: ${this.fmtEta(p.etaMs)}` : '';
@@ -1253,9 +1256,14 @@ const dc = {
         this.setInfo('outsize', '-');
         this.setInfo('intotal', this.fmtBytes(p.fileSize ? (this._intotal || 0) : 0));
         this.setInfo('ts', `${p.tsIndex}/${p.tsTotal}`);
+        // Phase-level + overall bytes progress
+        this.applyMergerPhases(p);
       } else if (p.phase === 'concat') {
         if (p.stage === 'starting') {
-          bar.style.width = '91%';
+          const ov = p.overallTotalBytes > 0
+            ? Math.min(100, (p.overallDoneBytes || 0) / p.overallTotalBytes * 100)
+            : 91;
+          bar.style.width = ov.toFixed(2) + '%';
           text.textContent = p.message || 'Concatenating...';
           eta.textContent = p.totalSeconds
             ? `Preparing concat: ${this.fmtDuration(p.totalSeconds)} total...`
@@ -1271,9 +1279,14 @@ const dc = {
           this.setInfo('bitrate', '-');
           this.setInfo('fps', '-');
           this.setInfo('outsize', '-');
+          // Phase 1 fully done; Phase 2 starting at 0%
+          this.applyMergerPhases(p);
         } else {
           // progress stage
-          bar.style.width = '95%';
+          const ov = p.overallTotalBytes > 0
+            ? Math.min(100, (p.overallDoneBytes || 0) / p.overallTotalBytes * 100)
+            : 95;
+          bar.style.width = ov.toFixed(2) + '%';
           text.textContent = p.message || 'Concatenating...';
           if (p.etaMs != null && p.etaMs >= 0) {
             eta.textContent = p.totalSeconds
@@ -1296,6 +1309,7 @@ const dc = {
           this.setInfo('elapsed', p.elapsedMs != null ? this.fmtEta(p.elapsedMs) : '-');
           this.setInfo('outsize', p.outputBytes != null ? this.fmtBytes(p.outputBytes) : '-');
           this.setInfo('ts', `${p.tsTotal || this._tsTotal || '-'}/${p.tsTotal || this._tsTotal || '-'}`);
+          this.applyMergerPhases(p);
         }
         } else if (p.phase === 'stats') {
         // Live stats — update the 5-row panel every 500ms.
@@ -1336,6 +1350,7 @@ const dc = {
         this.setInfo('eta1', '-');
         this.setInfo('eta2', '-');
         this.setInfo('elapsed', this.fmtEta((p.phase1Ms || 0) + (p.phase2Ms || 0)));
+        this.applyMergerPhases(p);
       } else if (p.phase === 'cancelled') {
         text.textContent = 'Cancelled';
         eta.textContent = '';
@@ -1359,9 +1374,41 @@ const dc = {
   resetInfoPanel() {
     ['stage', 'current', 'progress', 'speed', 'bitrate', 'fps',
      'eta1', 'eta2', 'elapsed', 'outsize', 'intotal', 'disk',
-     'cpu', 'mem', 'ts'].forEach((k) => this.setInfo(k, '-'));
+     'cpu', 'mem', 'ts', 'phase1', 'phase2', 'overall'].forEach((k) => this.setInfo(k, '-'));
     this._intotal = 0;
     this._tsTotal = 0;
+  },
+
+  // Render Phase 1 % / Phase 2 % / Overall cells from bytes payloads.
+  // Both phases weighted 1:1 in overall (phase 1 ~= sum of inputs, phase 2 ~= 0.93×).
+  applyMergerPhases(p) {
+    const p1 = p && p.phase1TotalBytes > 0
+      ? Math.min(100, (p.phase1DoneBytes || 0) / p.phase1TotalBytes * 100)
+      : null;
+    const p2 = p && p.phase2TotalBytes > 0
+      ? Math.min(100, (p.phase2DoneBytes || 0) / p.phase2TotalBytes * 100)
+      : null;
+    const o = p && p.overallTotalBytes > 0
+      ? Math.min(100, (p.overallDoneBytes || 0) / p.overallTotalBytes * 100)
+      : null;
+    if (p1 != null) {
+      this.setInfo('phase1',
+        p.phase1DoneBytes != null && p.phase1TotalBytes > 0
+          ? `${p1.toFixed(0)}% (${this.fmtBytes(p.phase1DoneBytes)}/${this.fmtBytes(p.phase1TotalBytes)})`
+          : `${p1.toFixed(0)}%`);
+    }
+    if (p2 != null) {
+      this.setInfo('phase2',
+        p.phase2DoneBytes != null && p.phase2TotalBytes > 0
+          ? `${p2.toFixed(0)}% (${this.fmtBytes(p.phase2DoneBytes)}/${this.fmtBytes(p.phase2TotalBytes)})`
+          : `${p2.toFixed(0)}%`);
+    }
+    if (o != null) {
+      this.setInfo('overall',
+        p.overallDoneBytes != null && p.overallTotalBytes > 0
+          ? `${o.toFixed(0)}% (${this.fmtBytes(p.overallDoneBytes)}/${this.fmtBytes(p.overallTotalBytes)})`
+          : `${o.toFixed(0)}%`);
+    }
   }
 };
 
