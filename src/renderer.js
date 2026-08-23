@@ -1434,6 +1434,22 @@ const splitter = {
     return `${m}m${s % 60}s`;
   },
 
+  // Compute overall job progress in bytes: prior files fully done + current file's portion.
+  // Falls back to per-file pct if total bytes aren't known yet.
+  computeOverallPct(p) {
+    const total = p && p.totalBytes > 0 ? p.totalBytes : 0;
+    if (!total) return { pct: (p && p.pct) || 0, done: 0, total: 0 };
+    const done = (p.processedBytes || 0) +
+      (p.fileSize && p.totalSec > 0 && p.processedSec != null
+        ? Math.round(p.fileSize * Math.min(1, p.processedSec / p.totalSec))
+        : 0);
+    return {
+      pct: Math.min(100, (done / total) * 100),
+      done,
+      total
+    };
+  },
+
   addPickedFiles(picked) {
     if (!picked || !picked.length) return;
     for (const f of picked) {
@@ -1526,6 +1542,8 @@ const splitter = {
     this.setInfo('stage', 'Starting');
     this.setInfo('current', '-');
     this.setInfo('progress', '0%');
+    this.setInfo('overall', '0% (0 B / 0 B)');
+    this.setInfo('speed', '-');
     this.setInfo('parts', '0');
     this.setInfo('eta', '-');
     this.setInfo('elapsed', '-');
@@ -1664,17 +1682,33 @@ const splitter = {
         this.setInfo('progress', '0%');
         cur.textContent = p.file || '';
       } else if (p.stage === 'progress') {
+        // Per-file progress bar (current file)
         bar.style.width = (p.pct != null ? p.pct.toFixed(0) : '0') + '%';
         text.textContent = p.message || `Splitting (${p.pct || 0}%)`;
         eta.textContent = p.etaMs != null ? `ETA: ${this.fmtEta(p.etaMs)}` : '';
+        // Job-wide bytes progress: prior files fully done + this file's portion so far
+        const overall = this.computeOverallPct(p);
         this.setInfo('progress', `${(p.pct || 0).toFixed(0)}%`);
+        this.setInfo('overall', `${overall.pct.toFixed(0)}% (${this.fmtBytes(overall.done)}/${this.fmtBytes(overall.total)})`);
         this.setInfo('eta', p.etaMs != null ? this.fmtEta(p.etaMs) : '-');
         this.setInfo('elapsed', p.elapsedMs != null ? this.fmtEta(p.elapsedMs) : '-');
+        if (p.speedup != null) {
+          this.setInfo('speed', `${p.speedup.toFixed(2)}× realtime`);
+        }
       } else if (p.stage === 'fileDone') {
         cur.textContent = '';
         text.textContent = p.message || `File done`;
         this.setInfo('stage', `Next file (${p.fileIndex}/${p.fileTotal})`);
+        // After file done: jump overall bar to reflect fully-completed bytes
+        const overall = this.computeOverallPct({
+          processedBytes: p.processedBytes,
+          totalBytes: p.totalBytes,
+          fileSize: 0,
+          processedSec: 0,
+          totalSec: 0
+        });
         this.setInfo('progress', '-');
+        this.setInfo('overall', `${overall.pct.toFixed(0)}% (${this.fmtBytes(overall.done)}/${this.fmtBytes(overall.total)})`);
         this.setInfo('eta', p.etaMs != null ? this.fmtEta(p.etaMs) : '-');
       } else if (p.stage === 'skipped') {
         text.textContent = p.message || `Skipped ${p.file}`;

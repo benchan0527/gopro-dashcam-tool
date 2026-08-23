@@ -1950,6 +1950,24 @@ ipcMain.handle('dashcam:split', async (event, options) => {
     const perFileTimings = []; // ms spent on each file split
     let processedFiles = 0;
 
+    // Pre-compute total bytes across all input files for bytes-based ETA.
+    // This is far more accurate than per-file averaging because processing time
+    // scales almost linearly with bytes (ffmpeg -c copy is I/O bound), and it
+    // avoids the cold-start bias where a single big first file skews the average.
+    let totalBytes = 0;
+    const fileSizes = new Array(files.length);
+    for (let i = 0; i < files.length; i++) {
+      try {
+        const st = fs.statSync(files[i]);
+        fileSizes[i] = st.size;
+        totalBytes += st.size;
+      } catch (e) {
+        fileSizes[i] = 0;
+      }
+    }
+    let processedBytes = 0; // bytes fully written so far (across completed files)
+    // fileStartMs already tracks the job start time (set above)
+
     for (let i = 0; i < files.length; i++) {
       if (cancelledRef.value) throw new Error('Cancelled');
 
@@ -1984,6 +2002,9 @@ ipcMain.handle('dashcam:split', async (event, options) => {
           file: path.basename(file),
           reason: 'unreadable / no duration (ffprobe failed)'
         });
+        // Count skipped file toward processed bytes for ETA accuracy
+        processedBytes += fileSize;
+        processedFiles++;
         send({
           phase: 'split',
           stage: 'skipped',
@@ -2052,20 +2073,32 @@ ipcMain.handle('dashcam:split', async (event, options) => {
             const processedSec = h * 3600 + m * 60 + sec;
             lastReportedSec = processedSec;
             const pct = durationSec > 0 ? Math.min(100, processedSec / durationSec * 100) : 0;
-            const etaMs = Math.max(0, (durationSec - processedSec) * 1000 / 1.2);
-            send({
-              phase: 'split',
-              stage: 'progress',
-              fileIndex: i + 1,
-              fileTotal: files.length,
-              file: path.basename(file),
-              processedSec,
-              totalSec: durationSec,
-              pct: +pct.toFixed(1),
-              etaMs,
-              elapsedMs: Date.now() - partStartMs,
-              message: `Splitting ${path.basename(file)} (${pct.toFixed(0)}%, ETA ${Math.ceil(etaMs / 1000)}s)`
-            });
+      // Per-file progress ETA: use real measured throughput (input seconds / wall seconds)
+      // instead of a fixed 1.2× realtime assumption. This auto-corrects for slow disks,
+      // network drives, etc. Falls back to /1.2 only until we have >=1s of real data.
+      const elapsedMs = Date.now() - partStartMs;
+      let etaMs;
+      const speedup = elapsedMs > 1000 && processedSec > 0
+        ? processedSec / (elapsedMs / 1000)   // input-seconds per wall-second
+        : 1.2;                                  // initial guess
+      etaMs = Math.max(0, (durationSec - processedSec) * 1000 / speedup);
+      send({
+        phase: 'split',
+        stage: 'progress',
+        fileIndex: i + 1,
+        fileTotal: files.length,
+        file: path.basename(file),
+        fileSize,
+        processedBytes,
+        totalBytes,
+        processedSec,
+        totalSec: durationSec,
+        pct: +pct.toFixed(1),
+        etaMs,
+        speedup: +speedup.toFixed(2),
+        elapsedMs,
+        message: `Splitting ${path.basename(file)} (${pct.toFixed(0)}%, ETA ${Math.ceil(etaMs / 1000)}s)`
+      });
           }
         });
         proc.on('close', (code) => {
@@ -2102,6 +2135,10 @@ ipcMain.handle('dashcam:split', async (event, options) => {
             }
           }
         } catch (e) {}
+        // Treat skipped file as "consumed" for ETA accounting (we won't revisit it)
+        processedBytes += fileSize;
+        processedFiles++;
+        perFileTimings.push(Date.now() - partStartMs);
         send({
           phase: 'split',
           stage: 'skipped',
@@ -2138,8 +2175,23 @@ ipcMain.handle('dashcam:split', async (event, options) => {
       const dt = Date.now() - partStartMs;
       // Replace estimate with actual measured time for this file -> better ETA
       perFileTimings[perFileTimings.length - 1] = dt;
-      const avgMs = perFileTimings.reduce((a, b) => a + b, 0) / perFileTimings.length;
-      const remainingMs = avgMs * (files.length - processedFiles);
+
+      // Job-wide ETA: bytes throughput is far more accurate than per-file averaging
+      // because it accounts for varying file sizes (big files take longer, small ones
+      // take less). Falls back to per-file average only if stat() failed earlier.
+      processedBytes += fileSize;
+      const jobElapsedMs = Date.now() - fileStartMs;
+      let remainingMs;
+      if (processedBytes > 0 && jobElapsedMs > 500 && totalBytes > 0) {
+        const bytesPerMs = processedBytes / jobElapsedMs;
+        const remainingBytes = Math.max(0, totalBytes - processedBytes);
+        remainingMs = remainingBytes / bytesPerMs;
+      } else {
+        // Fallback: simple average of per-file timings (only used if stat() failed)
+        const avgMs = perFileTimings.reduce((a, b) => a + b, 0) / perFileTimings.length;
+        remainingMs = avgMs * (files.length - processedFiles);
+      }
+
       send({
         phase: 'split',
         stage: 'fileDone',
@@ -2149,6 +2201,8 @@ ipcMain.handle('dashcam:split', async (event, options) => {
         partCount: partOutputs.length,
         lastMs: dt,
         etaMs: remainingMs,
+        processedBytes,
+        totalBytes,
         elapsedMs: Date.now() - fileStartMs,
         message: `Done ${path.basename(file)} -> ${partOutputs.length} part${partOutputs.length === 1 ? '' : 's'} (next ETA ${Math.ceil(remainingMs / 1000)}s)`
       });
