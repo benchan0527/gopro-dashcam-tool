@@ -1258,6 +1258,9 @@ const dc = {
         this.setInfo('ts', `${p.tsIndex}/${p.tsTotal}`);
         // Phase-level + overall bytes progress
         this.applyMergerPhases(p);
+        if (p.workerCount) {
+          this.setInfo('workers', p.workerCount);
+        }
       } else if (p.phase === 'concat') {
         if (p.stage === 'starting') {
           const ov = p.overallTotalBytes > 0
@@ -1374,7 +1377,7 @@ const dc = {
   resetInfoPanel() {
     ['stage', 'current', 'progress', 'speed', 'bitrate', 'fps',
      'eta1', 'eta2', 'elapsed', 'outsize', 'intotal', 'disk',
-     'cpu', 'mem', 'ts', 'phase1', 'phase2', 'overall'].forEach((k) => this.setInfo(k, '-'));
+     'cpu', 'mem', 'ts', 'phase1', 'phase2', 'overall', 'workers'].forEach((k) => this.setInfo(k, '-'));
     this._intotal = 0;
     this._tsTotal = 0;
   },

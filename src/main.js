@@ -1,6 +1,7 @@
 ﻿const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const { processPair } = require('../extract.js');
 const { spawn, exec } = require('child_process');
 
@@ -1581,133 +1582,176 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
         message: `Resumed: ${tsFiles.length} TS segments ready (${(tsBytes / 1024 / 1024 / 1024).toFixed(1)} GB)`
       });
     } else {
-      // ===== Phase 1: MP4 -> TS =====
+      // ===== Phase 1: MP4 -> TS (parallel) =====
       phase1StartMs = Date.now();
-    for (let i = 0; i < files.length; i++) {
-      if (cancelledRef.value) throw new Error('Cancelled');
 
-      const file = files[i];
-      const tsFile = path.join(workingDir, `part${String(i + 1).padStart(4, '0')}.ts`);
-      tsFiles.push(tsFile);
-
-      const fileSize = (() => { try { return fs.statSync(file).size; } catch (e) { return 0; } })();
-      currentFileStartMs = Date.now();
-      currentPhase = 'convert';
-      // Rolling average from completed files (tsTimings holds already-completed times)
-      const doneSoFar = tsTimings.length;
-      const tsAvgForEta = tsAvgMs > 0 ? tsAvgMs : 3000; // default 3s if no history yet
-      const remainingMs = doneSoFar < files.length
-        ? Math.round(tsAvgForEta * (files.length - doneSoFar))
-        : 0;
-      cachedEtaMs = remainingMs;
-      const t0 = Date.now();
-      send({
-        phase: 'convert',
-        stage: 'starting',
-        tsIndex: i + 1,
-        tsTotal: files.length,
-        file: path.basename(file),
-        fileSize,
-        eta1Ms: remainingMs,
-        tempDir: workingDir,
-        tempDirSource: workingDirSource,
-        phase1DoneBytes,
-        phase1TotalBytes,
-        phase2DoneBytes,
-        phase2TotalBytes,
-        overallTotalBytes,
-        overallDoneBytes: phase1DoneBytes + phase2DoneBytes,
-        message: `Converting ${path.basename(file)} -> TS (${workingDirSource})`
+      // Pre-compute all per-file metadata so workers don't re-stat the same files.
+      // Using os.cpus().length workers because ffmpeg -c copy is purely I/O bound
+      // (no decode, no CPU work) — bottleneck is disk read of the source MP4.
+      // Parallelism here typically yields 2-4× on SSDs and on a single disk where
+      // reads are sequential. On spinning HDDs with many workers the gain is smaller
+      // due to seek contention, but still positive.
+      const phase1Jobs = files.map((file, i) => {
+        const tsFile = path.join(workingDir, `part${String(i + 1).padStart(4, '0')}.ts`);
+        const fileSize = (() => { try { return fs.statSync(file).size; } catch (e) { return 0; } })();
+        return { file, tsFile, fileSize, index: i };
       });
+      // Reserve tsFiles slots in original order so phase 2 concat ordering is preserved.
+      // Workers will skip-shrink this array on failure (mirrors previous sequential behavior).
+      for (const j of phase1Jobs) tsFiles.push(j.tsFile);
 
-      let convertError = null;
-      await new Promise((resolve, reject) => {
-        const proc = spawn('ffmpeg', [
-          '-y', '-nostdin', '-hide_banner', '-loglevel', 'error',
-          '-i', file,
-          '-c', 'copy',
-          '-map', '0:v:0',
-          '-map', '0:a:0?',
-          '-f', 'mpegts',
-          tsFile
-        ], { windowsHide: true });
-        let stderr = '';
-        proc.stderr.on('data', (d) => { stderr += d.toString(); });
-        proc.on('close', (code) => {
-          if (code === 0) resolve();
-          else reject(new Error(`FFmpeg TS exit ${code}: ${stderr.slice(-300)}`));
-        });
-        proc.on('error', reject);
-        activeMerger.proc = proc;
-      }).catch((err) => {
-        // Input file is unreadable / truncated (e.g. missing moov atom from a
-        // crashed recording). Skip it instead of aborting the whole merge.
-        convertError = err;
-      });
+      const cpuCount = Math.max(1, os.cpus().length);
+      // Cap to file count: no point spawning more workers than files.
+      const workerCount = Math.min(cpuCount, phase1Jobs.length);
 
-      if (convertError) {
-        const reason = convertError.message.includes('moov atom')
-          ? 'truncated/corrupt (no moov atom)'
-          : convertError.message;
-        skippedInputs.push({ file: path.basename(file), reason });
-        // Roll back the .ts entry so concat ignores this slot
-        tsFiles.pop();
-        try { fs.unlinkSync(tsFile); } catch (e) {}
-        // Count skipped file as "consumed" for overall progress
-        phase1DoneBytes += fileSize;
-        skippedFilesBytes += fileSize;
+      // Emit one starting event for each file (UI consistency with sequential version).
+      // Phase 1 ETA: rough estimate = total bytes / aggregate observed throughput;
+      // before any data exists, default to 3s per file.
+      const initialAvg = tsAvgMs > 0 ? tsAvgMs : 3000;
+      cachedEtaMs = initialAvg * Math.max(0, phase1Jobs.length - tsTimings.length);
+      for (let i = 0; i < phase1Jobs.length; i++) {
+        const j = phase1Jobs[i];
         send({
           phase: 'convert',
-          stage: 'skipped',
+          stage: 'starting',
           tsIndex: i + 1,
           tsTotal: files.length,
-          file: path.basename(file),
-          fileSize,
+          file: path.basename(j.file),
+          fileSize: j.fileSize,
+          eta1Ms: cachedEtaMs,
+          tempDir: workingDir,
+          tempDirSource: workingDirSource,
+          workerCount,
           phase1DoneBytes,
           phase1TotalBytes,
           phase2DoneBytes,
           phase2TotalBytes,
           overallTotalBytes,
           overallDoneBytes: phase1DoneBytes + phase2DoneBytes,
-          message: `Skipped ${path.basename(file)}: ${reason}`
+          message: `Converting ${path.basename(j.file)} -> TS (${workingDirSource})`
         });
-        continue;
       }
 
-      const dt = Date.now() - t0;
-      tsTimings.push(dt);
-      tsFilesDone = i + 1;
-      phase1DoneBytes += fileSize;
+      let nextJob = 0;
+      let activeWorkers = 0;
+      let cancelFlag = false;
 
-      const avgMs = tsTimings.reduce((a, b) => a + b, 0) / tsTimings.length;
-      const remaining = avgMs * (files.length - (i + 1));
-      cachedEtaMs = remaining;
-      const mbPerSec = dt > 0 ? (fileSize / 1024 / 1024) / (dt / 1000) : 0;
-      send({
-        phase: 'convert',
-        stage: 'done',
-        tsIndex: i + 1,
-        tsTotal: files.length,
-        file: path.basename(file),
-        fileSize,
-        lastMs: dt,
-        avgMs: tsAvgMs,
-        etaMs: remaining,
-        eta1Ms: remaining,
-        mbPerSec: +mbPerSec.toFixed(1),
-        phase1DoneBytes,
-        phase1TotalBytes,
-        phase2DoneBytes,
-        phase2TotalBytes,
-        overallTotalBytes,
-        overallDoneBytes: phase1DoneBytes + phase2DoneBytes,
-        elapsedMs: Date.now() - phase1StartMs,
-        message: `Converted ${i + 1}/${files.length} (${mbPerSec.toFixed(1)} MB/s, ETA ${Math.ceil(remaining / 1000)}s)`
-      });
+      const runOneJob = async (workerId) => {
+        while (!cancelFlag) {
+          const myIdx = nextJob++;
+          if (myIdx >= phase1Jobs.length) return;
+          if (cancelledRef.value) { cancelFlag = true; return; }
+          activeWorkers++;
+          try {
+            const job = phase1Jobs[myIdx];
+            const t0 = Date.now();
+            currentFileStartMs = t0;
+            currentPhase = 'convert';
+            const convertError = await new Promise((resolve) => {
+              const proc = spawn('ffmpeg', [
+                '-y', '-nostdin', '-hide_banner', '-loglevel', 'error',
+                '-i', job.file,
+                '-c', 'copy',
+                '-map', '0:v:0',
+                '-map', '0:a:0?',
+                '-f', 'mpegts',
+                job.tsFile
+              ], { windowsHide: true });
+              let stderr = '';
+              proc.stderr.on('data', (d) => { stderr += d.toString(); });
+              proc.on('close', (code) => {
+                if (code === 0) resolve(null);
+                else resolve(new Error(`FFmpeg TS exit ${code}: ${stderr.slice(-300)}`));
+              });
+              proc.on('error', resolve);
+              // Track this as the active proc for cancellation; the most-recently
+              // started worker is the one to cancel on user request.
+              activeMerger.proc = proc;
+            }).catch((err) => err);
+
+            if (convertError) {
+              const reason = convertError.message.includes('moov atom')
+                ? 'truncated/corrupt (no moov atom)'
+                : convertError.message;
+              skippedInputs.push({ file: path.basename(job.file), reason });
+              // Drop this slot from the concat list so phase 2 ignores it.
+              const slotIdx = tsFiles.indexOf(job.tsFile);
+              if (slotIdx >= 0) tsFiles.splice(slotIdx, 1);
+              try { fs.unlinkSync(job.tsFile); } catch (e) {}
+              phase1DoneBytes += job.fileSize;
+              skippedFilesBytes += job.fileSize;
+              send({
+                phase: 'convert',
+                stage: 'skipped',
+                tsIndex: myIdx + 1,
+                tsTotal: files.length,
+                file: path.basename(job.file),
+                fileSize: job.fileSize,
+                workerId,
+                workerCount,
+                phase1DoneBytes,
+                phase1TotalBytes,
+                phase2DoneBytes,
+                phase2TotalBytes,
+                overallTotalBytes,
+                overallDoneBytes: phase1DoneBytes + phase2DoneBytes,
+                message: `Skipped ${path.basename(job.file)}: ${reason}`
+              });
+              continue;
+            }
+
+            const dt = Date.now() - t0;
+            tsTimings.push(dt);
+            tsFilesDone = (tsFilesDone || 0) + 1;
+            phase1DoneBytes += job.fileSize;
+
+            // Bytes-throughput ETA: how many bytes remain × wall-time-per-byte.
+            const elapsed = Date.now() - phase1StartMs;
+            const bytesPerMs = elapsed > 0 ? phase1DoneBytes / elapsed : 0;
+            const remainingBytes = Math.max(0, phase1TotalBytes - phase1DoneBytes);
+            const remaining = bytesPerMs > 0 ? remainingBytes / bytesPerMs : 0;
+            cachedEtaMs = remaining;
+            const mbPerSec = dt > 0 ? (job.fileSize / 1024 / 1024) / (dt / 1000) : 0;
+            const avgMs = tsTimings.reduce((a, b) => a + b, 0) / tsTimings.length;
+            send({
+              phase: 'convert',
+              stage: 'done',
+              tsIndex: myIdx + 1,
+              tsTotal: files.length,
+              file: path.basename(job.file),
+              fileSize: job.fileSize,
+              lastMs: dt,
+              avgMs: tsAvgMs,
+              etaMs: remaining,
+              eta1Ms: remaining,
+              mbPerSec: +mbPerSec.toFixed(1),
+              workerId,
+              workerCount,
+              phase1DoneBytes,
+              phase1TotalBytes,
+              phase2DoneBytes,
+              phase2TotalBytes,
+              overallTotalBytes,
+              overallDoneBytes: phase1DoneBytes + phase2DoneBytes,
+              elapsedMs: Date.now() - phase1StartMs,
+              message: `Converted ${path.basename(job.file)} (${mbPerSec.toFixed(1)} MB/s, ${activeWorkers}/${workerCount} workers active, ETA ${Math.ceil(remaining / 1000)}s)`
+            });
+          } finally {
+            activeWorkers--;
+          }
+        }
+      };
+
+      // Launch worker pool. Workers race through phase1Jobs; on cancel, the loop
+      // returns early via cancelFlag and remaining ffmpeg processes get killed via
+      // activeMerger.proc (last-started) on cancellation cleanup.
+      await Promise.all(
+        Array.from({ length: workerCount }, (_, w) => runOneJob(w))
+      );
+
+      if (cancelledRef.value) throw new Error('Cancelled');
     }
     phase1Ms = Date.now() - phase1StartMs;
-
-    if (cancelledRef.value) throw new Error('Cancelled');
 
     if (tsFiles.length === 0) {
       const list = skippedInputs.map((s) => `• ${s.file} (${s.reason})`).join('\n');
@@ -1721,7 +1765,6 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
       .map((t) => `file '${t.replace(/\\/g, '/')}'`)
       .join('\n') + '\n';
     fs.writeFileSync(fileListPath, listContent, 'utf8');
-    }
 
     // ===== Phase 2: Concat TS -> MP4 (or split into segments if oversized) =====
     // Phase 1 is now done; roll remaining bytes into phase 2 denominator.
