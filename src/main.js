@@ -1264,10 +1264,18 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
   // Estimated final output size: concat is -c copy, so ~93% of input size
   // (TS rewrap is slightly smaller than MP4 due to removing MP4 container overhead).
   const estimatedFinalBytes = Math.ceil(totalInputBytes * 0.93);
-  // Split if EITHER limit is exceeded; take the larger of the two segment counts.
+  // Split only when BOTH bytes and time limits are exceeded. Triggering on either
+  // alone produces surprising splits for total footage that exceeds 12h but is well
+  // under 256 GB (e.g. 36h of 4 Mbps dashcam = 65 GB ends up as 3 × 22 GB parts).
+  // To get a single file that exceeds the time limit, the user can raise the time
+  // limit in the UI; if they only need to keep below 256 GB, no split is wanted.
   const bytesLimit   = Math.ceil(estimatedFinalBytes / maxSegmentBytes);
   const timeLimit    = Math.ceil(totalInputSeconds / maxSegmentSeconds);
-  const segmentCount = Math.max(bytesLimit, timeLimit);
+  const exceedsBytes = estimatedFinalBytes > maxSegmentBytes;
+  const exceedsTime  = totalInputSeconds > maxSegmentSeconds;
+  // If only one limit is exceeded, ignore it: produce a single output.
+  // If both are exceeded, use the larger of the two segment counts.
+  const segmentCount = (exceedsBytes && exceedsTime) ? Math.max(bytesLimit, timeLimit) : 1;
   const needsSplit   = segmentCount > 1;
   // segment_time (sec): use the more restrictive time-based split to honour both limits.
   // 95% safety margin to guard against variable bitrate / rounding errors.
@@ -2119,12 +2127,19 @@ ipcMain.handle('dashcam:split', async (event, options) => {
         continue;
       }
 
-      // Compute segmentTime honouring BOTH byte and duration limits.
+      // Compute segmentTime honouring BOTH byte and duration limits. Only split
+      // when BOTH bytes and time exceed — same logic as the merger, so a 200 GB
+      // 8h file is not needlessly chopped into 1h pieces just because the time
+      // limit prefers shorter parts.
       // bytesLimit = ceil(size / maxSegmentBytes); timeLimit = ceil(dur / maxSec)
       // segmentTime = (duration / segmentCount) * 0.95
       const bytesLimit  = Math.ceil(fileSize / maxSegmentBytes);
       const timeLimit   = Math.ceil(durationSec / maxSegmentSeconds);
-      const segmentCount = Math.max(1, bytesLimit, timeLimit);
+      const exceedsBytes = fileSize > maxSegmentBytes;
+      const exceedsTime  = durationSec > maxSegmentSeconds;
+      const segmentCount = (exceedsBytes && exceedsTime)
+        ? Math.max(1, bytesLimit, timeLimit)
+        : 1;
       const segmentTime = Math.max(1, Math.floor((durationSec / segmentCount) * 0.95));
 
       // Estimate total wall time for ETA: ~duration / 1.2 (split is faster than concat)
