@@ -6,7 +6,9 @@
   "scripts": {
     "start": "electron .",
     "extract": "node extract.js",
-    "test": "node extract.js"
+    "test": "node extract.js",
+    "pack": "electron-builder --win nsis --x64",
+    "dist": "electron-builder --win nsis --x64 --publish never"
   },
   "keywords": [
     "gopro",
@@ -22,10 +24,61 @@
   "dependencies": {
     "gpmf-extract": "^0.3.2",
     "gopro-telemetry": "^1.2.11",
-    "node-geocoder": "^4.2.0",
-    "electron": "^28.0.0"
+    "node-geocoder": "^4.2.0"
   },
   "devDependencies": {
+    "electron": "^28.0.0",
     "electron-builder": "^24.9.1"
+  },
+  "build": {
+    "appId": "com.gopro.dashcam.tool",
+    "productName": "GoPro Dashcam Tool",
+    "asar": true,
+    "directories": {
+      "output": "dist",
+      "buildResources": "resources"
+    },
+    "files": [
+      "src/**/*",
+      "extract.js",
+      "package.json",
+      "package-lock.json",
+      "node_modules/**/*",
+      "!**/node_modules/*/{CHANGELOG.md,README.md,README,readme.md,readme}",
+      "!**/node_modules/*/{test,__tests__,tests,powered-test,example,examples}",
+      "!**/node_modules/*.d.ts",
+      "!**/node_modules/.bin",
+      "!**/{.DS_Store,.git,.svn,.hg,CVS,RCS,SCCS,*.gypi}"
+    ],
+    "extraResources": [
+      {
+        "from": "resources/ffmpeg.exe",
+        "to": "ffmpeg.exe"
+      },
+      {
+        "from": "resources/ffprobe.exe",
+        "to": "ffprobe.exe"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "${productName}-Setup-${version}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "GoPro Dashcam Tool",
+      "uninstallDisplayName": "GoPro Dashcam Tool"
+    }
   }
 }

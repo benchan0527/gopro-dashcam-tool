@@ -9,6 +9,24 @@ let mainWindow;
 let activeMerger = null; // { proc, cancelled }
 let activeSplitter = null; // { proc, cancelled }
 
+// Resolve bundled ffmpeg / ffprobe binaries.
+// - In dev (running `electron .`): look in repo's `resources/` next to package.json
+// - Packaged (electron-builder NSIS): `extraResources` copies them to `process.resourcesPath/`
+// If a system-installed ffmpeg/ffprobe is on PATH, that wins (lets power users override).
+function resolveTool(name) {
+  const exe = process.platform === 'win32' ? `${name}.exe` : name;
+  const inRepo = path.join(__dirname, '..', 'resources', exe);
+  const inPackaged = process.resourcesPath ? path.join(process.resourcesPath, exe) : null;
+  const candidates = [];
+  if (app.isPackaged && inPackaged) candidates.push(inPackaged);
+  candidates.push(inRepo);
+  for (const p of candidates) {
+    try { if (fs.existsSync(p)) return p; } catch (e) {}
+  }
+  // Fall back to PATH lookup (system-installed binary)
+  return exe;
+}
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1100,
@@ -220,7 +238,7 @@ async function getVideoCreationDate(filePath) {
       filePath
     ];
     
-    const ffprobe = spawn('ffprobe', args);
+    const ffprobe = spawn(resolveTool('ffprobe'), args);
     let output = '';
     
     ffprobe.stdout.on('data', (data) => {
@@ -361,7 +379,7 @@ async function mergeSrtFiles(sortedFiles, sortedSrtFiles, outputPath) {
     let fileDuration = 0;
     try {
       const { execSync } = require('child_process');
-      const output = execSync(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${videoPath}"`, {
+      const output = execSync(`"${resolveTool('ffprobe')}" -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${videoPath}"`, {
         encoding: 'utf-8',
         stdio: ['pipe', 'pipe', 'pipe']
       });
@@ -537,8 +555,8 @@ ipcMain.handle('merge-videos', async (event, options) => {
           mergedPath
         ];
         
-        const ffmpeg = spawn('ffmpeg', args);
-        
+        const ffmpegBin = resolveTool('ffmpeg');
+        const ffmpeg = spawn(ffmpegBin, args);
         ffmpeg.stderr.on('data', (data) => {
           ffmpegError = data.toString();
           const timeMatch = data.toString().match(/time=(\d{2}):(\d{2}):(\d{2})/);
@@ -614,9 +632,9 @@ ipcMain.handle('merge-videos', async (event, options) => {
             finalPath
           ];
           
-          const ffmpeg = spawn('ffmpeg', args);
-          
-          ffmpeg.on('close', (code) => {
+            const ffmpegBin = resolveTool('ffmpeg');
+            const ffmpeg = spawn(ffmpegBin, args);
+            ffmpeg.on('close', (code) => {
             if (code === 0) {
               resolve();
             } else {
@@ -983,7 +1001,7 @@ function isVideoFile(name) {
 
 function ffprobeJson(filePath) {
   return new Promise((resolve) => {
-    const proc = spawn('ffprobe', [
+    const proc = spawn(resolveTool('ffprobe'), [
       '-v', 'quiet',
       '-print_format', 'json',
       '-show_format',
@@ -1656,7 +1674,7 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
             currentFileStartMs = t0;
             currentPhase = 'convert';
             const convertError = await new Promise((resolve) => {
-              const proc = spawn('ffmpeg', [
+              const proc = spawn(resolveTool('ffmpeg'), [
                 '-y', '-nostdin', '-hide_banner', '-loglevel', 'error',
                 '-i', job.file,
                 '-c', 'copy',
@@ -1821,7 +1839,7 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
           finalPath
         ];
     await new Promise((resolve, reject) => {
-      const proc = spawn('ffmpeg', ffmpegArgs, { windowsHide: true });
+      const proc = spawn(resolveTool('ffmpeg'), ffmpegArgs, { windowsHide: true });
       let stderr = '';
       proc.stderr.on('data', (d) => {
         const s = d.toString();
@@ -2161,7 +2179,7 @@ ipcMain.handle('dashcam:split', async (event, options) => {
 
       let splitError = null;
       await new Promise((resolve, reject) => {
-        const proc = spawn('ffmpeg', [
+        const proc = spawn(resolveTool('ffmpeg'), [
           '-y', '-nostdin', '-hide_banner', '-loglevel', 'info',
           '-i', file,
           '-c', 'copy',

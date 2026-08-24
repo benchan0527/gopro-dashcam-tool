@@ -67,3 +67,6 @@ part*.ts
 # ===== Local environment =====
 .env
 .env.local
+
+# ===== Electron-builder output =====
+dist/

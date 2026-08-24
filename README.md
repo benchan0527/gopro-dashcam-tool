@@ -286,6 +286,25 @@ gopro-dashcam-tool/
 └── package.json
 ```
 
+### Building a Windows installer
+
+`ffmpeg.exe` and `ffprobe.exe` are bundled with the installer, so **end users don't need any pre-installed tooling** (no Node.js, no ffmpeg, no PATH setup).
+
+```bash
+# One-time: install electron-builder
+npm install
+
+# Build a Windows NSIS installer (~80 MB)
+npm run dist
+# → dist/GoPro Dashcam Tool-Setup-1.0.0.exe
+```
+
+End users just double-click the `.exe`, pick an install folder, done. The installer:
+- Installs `GoPro Dashcam Tool` to `%LocalAppData%\Programs\GoPro Dashcam Tool\`
+- Bundles `ffmpeg.exe` + `ffprobe.exe` to `resources\`
+- Creates Desktop + Start Menu shortcuts
+- Supports x64 Windows 10 / 11
+
 ### Troubleshooting
 
 | 問題 | 解法 |
