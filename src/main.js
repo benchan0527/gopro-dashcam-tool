@@ -1406,8 +1406,10 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
       // Sum all matching part files (each ffmpeg-segment output)
       try {
         const dir = path.dirname(segmentPattern);
-        const base = path.basename(segmentPattern).replace('%03d', '');
-        const re = new RegExp('^' + base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace('\\d\\d\\d', '\\d+') + '$');
+        const base = path.basename(segmentPattern);
+        // %03d in pattern => \d{3} in regex
+        const escaped = base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/%03d/g, '\\d{3}');
+        const re = new RegExp('^' + escaped + '$');
         for (const f of fs.readdirSync(dir)) {
           if (re.test(f)) {
             try { outputSize += fs.statSync(path.join(dir, f)).size; } catch (e) {}
@@ -1920,8 +1922,10 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
     if (needsSplit) {
       // Glob pattern: enumerate part000.mp4, part001.mp4, ... in order
       const dir = path.dirname(segmentPattern);
-      const basePattern = path.basename(segmentPattern).replace('%03d', '');
-      const re = new RegExp('^' + basePattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace('\\d\\d\\d', '(\\d+)') + '$');
+      const basePattern = path.basename(segmentPattern);
+      // %03d in pattern => \d{3} in regex
+      const escaped = basePattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/%03d/g, '\\d{3}');
+      const re = new RegExp('^' + escaped + '$');
       try {
         const allFiles = fs.readdirSync(dir);
         const matches = allFiles
