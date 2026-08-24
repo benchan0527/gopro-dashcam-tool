@@ -990,6 +990,96 @@ const dc = {
     this.$('dc-list-summary').textContent =
       `${sel.length} of ${this.files.length} selected — ${this.fmtBytes(totalSize)}, total ${this.fmtDuration(totalDur)}`;
     this.$('dc-start-merge').disabled = sel.length < 2 || this.merging;
+    this.updateSplitPreview();
+  },
+
+  // Compute split preview from selected files and current limit inputs.
+  // Returns null when no preview can be shown (not enough data).
+  computeSplitPreviewData() {
+    const sel = this.files.filter((f) => f.selected);
+    if (sel.length === 0) return null;
+
+    const totalBytes = sel.reduce((a, b) => a + b.size, 0);
+    const totalSec   = sel.reduce((a, b) => a + (b.duration || 0), 0);
+    if (totalSec === 0) return null; // no duration data yet
+
+    const maxGB     = Math.max(1, parseInt(this.$('dc-max-gb').value, 10) || 512);
+    const maxHours  = Math.max(1, parseInt(this.$('dc-max-hours').value, 10) || 24);
+    const maxBytes  = maxGB * 1024 * 1024 * 1024;
+    const maxSecs   = maxHours * 3600;
+    const estimated = Math.ceil(totalBytes * 0.93);
+
+    const bytesLimit   = Math.ceil(estimated / maxBytes);
+    const timeLimit    = Math.ceil(totalSec  / maxSecs);
+    const segmentCount = Math.max(bytesLimit, timeLimit);
+    const needsSplit   = segmentCount > 1;
+
+    return {
+      totalBytes, totalSec, estimated,
+      maxGB, maxHours, maxBytes, maxSecs,
+      bytesLimit, timeLimit, segmentCount, needsSplit,
+      avgPerPart: needsSplit ? +(estimated / segmentCount / 1024 / 1024 / 1024).toFixed(2) : null,
+      avgDurPerPart: needsSplit ? (totalSec / segmentCount) : null
+    };
+  },
+
+  updateSplitPreview() {
+    const el = this.$('dc-split-preview');
+    const data = this.computeSplitPreviewData();
+    if (!data) {
+      el.style.display = 'none';
+      return;
+    }
+    el.style.display = 'block';
+    const { totalBytes, totalSec, estimated, maxGB, maxHours,
+            bytesLimit, timeLimit, segmentCount, needsSplit,
+            avgPerPart, avgDurPerPart } = data;
+
+    const fmtGB = (b) => (b / 1024 / 1024 / 1024).toFixed(2);
+    const fmtH  = (s) => s >= 3600 ? `${(s / 3600).toFixed(1)}h` : `${Math.round(s / 60)}m`;
+
+    const limitInfo = needsSplit
+      ? `<div class="preview-row">
+           <span class="preview-label">Parts</span>
+           <span class="preview-warn">${segmentCount} parts</span>
+         </div>
+         <div class="preview-row">
+           <span class="preview-label">Avg per part</span>
+           <span class="preview-warn">${avgPerPart} GB / ${fmtH(avgDurPerPart)}</span>
+         </div>
+         <div class="preview-row">
+           <span class="preview-label">Limits</span>
+           <span class="preview-value">≤ ${maxGB} GB or ≤ ${maxHours}h</span>
+         </div>
+         <div class="preview-row">
+           <span class="preview-label">Bytes triggers</span>
+           <span class="preview-value">${bytesLimit} part(s)</span>
+         </div>
+         <div class="preview-row">
+           <span class="preview-label">Time triggers</span>
+           <span class="preview-value">${timeLimit} part(s)</span>
+         </div>`
+      : `<div class="preview-row">
+           <span class="preview-label">Status</span>
+           <span class="preview-ok">Single output — within limits</span>
+         </div>
+         <div class="preview-row">
+           <span class="preview-label">Limits</span>
+           <span class="preview-value">≤ ${maxGB} GB and ≤ ${maxHours}h</span>
+         </div>`;
+
+    el.innerHTML = `
+      <div class="preview-row">
+        <span class="preview-label">Total input</span>
+        <span class="preview-value">${fmtGB(totalBytes)} GB / ${fmtH(totalSec)}</span>
+      </div>
+      <div class="preview-row">
+        <span class="preview-label">Est. output</span>
+        <span class="preview-value">${fmtGB(estimated)} GB</span>
+      </div>
+      <hr class="preview-divider">
+      ${limitInfo}
+    `;
   },
 
   selectAll(v) { this.files.forEach((f) => f.selected = v); this.renderList(); },
@@ -1436,10 +1526,18 @@ dc.$('dc-resume-dismiss').addEventListener('click', () => dc.dismissResume());
 
 // Toggle split options visibility
 dc.$('dc-enable-split').addEventListener('change', (e) => {
-  dc.$('dc-split-options').style.display = e.target.checked ? '' : 'none';
+  const visible = e.target.checked;
+  dc.$('dc-split-options').style.display = visible ? '' : 'none';
+  dc.$('dc-split-preview').style.display = visible ? '' : 'none';
+  if (visible) dc.updateSplitPreview();
 });
 // Initial visibility (checked = show options)
 dc.$('dc-split-options').style.display = dc.$('dc-enable-split').checked ? '' : 'none';
+
+// Live update split preview when limits change
+['dc-max-gb', 'dc-max-hours'].forEach((id) => {
+  dc.$(id).addEventListener('input', () => dc.updateSplitPreview());
+});
 
 // Re-detect resume state when output-name changes (cheap scan)
 dc.$('dc-output-name').addEventListener('change', () => dc.detectResume());
@@ -1558,6 +1656,68 @@ const splitter = {
         this.removeFile(btn.dataset.path);
       });
     });
+    this.updateSpSplitPreview();
+  },
+
+  // Compute per-file split preview for the Splitter tab.
+  computeSpSplitPreviewData(file) {
+    if (!file.duration) return null;
+    const maxGB    = Math.max(1, parseInt(this.$('sp-max-gb').value, 10) || 512);
+    const maxHours = Math.max(1, parseInt(this.$('sp-max-hours').value, 10) || 24);
+    const maxBytes = maxGB * 1024 * 1024 * 1024;
+    const maxSecs  = maxHours * 3600;
+
+    const bytesLimit   = Math.ceil(file.size / maxBytes);
+    const timeLimit    = Math.ceil(file.duration / maxSecs);
+    const segmentCount = Math.max(bytesLimit, timeLimit);
+    const needsSplit  = segmentCount > 1;
+    return {
+      bytesLimit, timeLimit, segmentCount, needsSplit,
+      avgPerPart: needsSplit ? +(file.size / segmentCount / 1024 / 1024 / 1024).toFixed(2) : null,
+      avgDurPerPart: needsSplit ? file.duration / segmentCount : null,
+      maxGB, maxHours
+    };
+  },
+
+  updateSpSplitPreview() {
+    const el = this.$('sp-split-preview');
+    if (!el) return;
+    const files = this.files.filter((f) => f.size);
+    if (files.length === 0) {
+      el.style.display = 'none';
+      return;
+    }
+    el.style.display = 'block';
+
+    const fmtGB = (b) => (b / 1024 / 1024 / 1024).toFixed(2);
+    const fmtH  = (s) => s >= 3600 ? `${(s / 3600).toFixed(1)}h` : `${Math.round(s / 60)}m`;
+
+    const rows = files.map((f) => {
+      const data = this.computeSpSplitPreviewData(f);
+      const totalGB = fmtGB(f.size);
+      if (!data) {
+        return `<div class="preview-row">
+          <span class="preview-label">${f.name || 'file'}</span>
+          <span class="preview-value">${totalGB} GB (probing...)</span>
+        </div>`;
+      }
+      const { bytesLimit, timeLimit, segmentCount, needsSplit, avgPerPart, avgDurPerPart, maxGB, maxHours } = data;
+      if (!needsSplit) {
+        return `<div class="preview-row">
+          <span class="preview-label">${f.name || 'file'}</span>
+          <span class="preview-ok">${totalGB} GB / ${fmtH(f.duration)} — 1 output</span>
+        </div>`;
+      }
+      return `<div class="preview-row">
+        <span class="preview-label">${f.name || 'file'}</span>
+        <span class="preview-warn">→ ${segmentCount} parts (${avgPerPart} GB / ${fmtH(avgDurPerPart)} each)</span>
+      </div>
+      <div class="preview-row" style="font-size:0.8rem;color:#8899aa;margin-left:20px">
+        <span>Limits: ≤ ${maxGB} GB or ≤ ${maxHours}h | Size→${bytesLimit} parts, Time→${timeLimit} parts</span>
+      </div>`;
+    });
+
+    el.innerHTML = `<div style="margin-bottom:4px;font-weight:600;color:#445">Split preview:</div>${rows.join('')}`;
   },
 
   async pickOutput() {
@@ -1696,6 +1856,11 @@ const splitter = {
     this.$('sp-pick-output').addEventListener('click', () => this.pickOutput());
     this.$('sp-start').addEventListener('click', () => this.startSplit());
     this.$('sp-cancel').addEventListener('click', () => this.cancelSplit());
+
+    // Live update split preview when limits change
+    ['sp-max-gb', 'sp-max-hours'].forEach((id) => {
+      this.$(id).addEventListener('input', () => this.updateSpSplitPreview());
+    });
 
     // Listen ONLY to splitter-tagged events (phase:split or terminal cancelled/error)
     electronAPI.onDashcamProgress((p) => {

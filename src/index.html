@@ -82,6 +82,45 @@
       font-size: 0.85rem;
       margin-top: 6px;
     }
+    .split-preview {
+      background: #f0f4f8;
+      border: 1px solid #d0dae8;
+      border-radius: 8px;
+      padding: 12px 16px;
+      margin-top: 10px;
+      font-size: 0.88rem;
+      line-height: 1.6;
+    }
+    .split-preview .preview-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 24px;
+    }
+    .split-preview .preview-label {
+      color: #667788;
+    }
+    .split-preview .preview-value {
+      font-weight: 600;
+      color: #334455;
+    }
+    .split-preview .preview-warn {
+      color: #e67e22;
+      font-weight: 600;
+    }
+    .split-preview .preview-ok {
+      color: #27ae60;
+      font-weight: 600;
+    }
+    .split-preview .preview-divider {
+      border: none;
+      border-top: 1px solid #d0dae8;
+      margin: 8px 0;
+    }
+    .split-preview .preview-parts {
+      margin-top: 6px;
+      color: #667788;
+      font-size: 0.82rem;
+    }
     .hint-inline {
       color: #8899aa;
       font-size: 0.8rem;
@@ -842,6 +881,9 @@
           <input type="number" id="dc-max-hours" value="24" min="1" max="48" style="width:60px"> hours
         </label>
       </div>
+
+      <!-- ===== Split preview ===== -->
+      <div id="dc-split-preview" class="split-preview" style="display:none"></div>
     </div>
 
     <div class="card">
@@ -1014,6 +1056,9 @@
         </label>
       </div>
       <div class="hint">A file will be split into however many parts are needed so that no part exceeds either limit. Default: 512 GB or 24 hours.</div>
+
+      <!-- ===== Split preview ===== -->
+      <div id="sp-split-preview" class="split-preview" style="display:none"></div>
     </div>
 
     <div class="card">
