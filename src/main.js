@@ -1270,10 +1270,15 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
   const timeLimit    = Math.ceil(totalInputSeconds / maxSegmentSeconds);
   const segmentCount = Math.max(bytesLimit, timeLimit);
   const needsSplit   = segmentCount > 1;
-  // segment_time (sec): use the more restrictive time-based split to honour both limits.
-  // 95% safety margin to guard against variable bitrate / rounding errors.
+  // segment_time: use the smallest per-part target so neither limit is exceeded.
+  // Without safety margin: ffmpeg's segment muxer cuts at the requested duration
+  // (it may shift to next keyframe which adds a few seconds but never crosses
+  // into a 3rd segment). Using *0.95 caused off-by-one splits when total duration
+  // is just barely >= segmentCount * maxSeconds (e.g. 12.6h / 2 = 6.3h parts
+  // produced 3 outputs instead of 2 because the 5% margin made 12.6h / (6.3h*0.95)
+  // = 2.10 segments).
   const segmentTime = needsSplit
-    ? Math.floor((totalInputSeconds / segmentCount) * 0.95)
+    ? Math.max(1, Math.floor(totalInputSeconds / segmentCount))
     : 0;
   const segmentPattern = path.join(outputDir, `${finalName}_part%03d.mp4`);
   const finalPathSingle = path.join(outputDir, `${finalName}.mp4`);
@@ -2122,11 +2127,11 @@ ipcMain.handle('dashcam:split', async (event, options) => {
 
       // Compute segmentTime honouring BOTH byte and duration limits.
       // bytesLimit = ceil(size / maxSegmentBytes); timeLimit = ceil(dur / maxSec)
-      // segmentTime = (duration / segmentCount) * 0.95
+      // segmentTime = totalDuration / segmentCount (no safety margin: see dashcam:merge)
       const bytesLimit  = Math.ceil(fileSize / maxSegmentBytes);
       const timeLimit   = Math.ceil(durationSec / maxSegmentSeconds);
       const segmentCount = Math.max(1, bytesLimit, timeLimit);
-      const segmentTime = Math.max(1, Math.floor((durationSec / segmentCount) * 0.95));
+      const segmentTime = Math.max(1, Math.floor(durationSec / segmentCount));
 
       // Estimate total wall time for ETA: ~duration / 1.2 (split is faster than concat)
       const estPartMs = Math.ceil(durationSec * 1000 / Math.max(1, segmentCount) / 1.2);

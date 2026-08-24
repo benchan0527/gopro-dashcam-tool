@@ -1058,7 +1058,8 @@ const dc = {
          <div class="preview-row">
            <span class="preview-label">Time triggers</span>
            <span class="preview-value">${timeLimit} part(s)</span>
-         </div>`
+         </div>
+         <div class="preview-parts">Note: actual part count is exact (ffmpeg segment muxer cuts at the target duration; may shift a few seconds to next keyframe but won't add extra parts).</div>`
       : `<div class="preview-row">
            <span class="preview-label">Status</span>
            <span class="preview-ok">Single output — within limits</span>
