@@ -1057,7 +1057,7 @@ const dc = {
         ≈ ${state.estimatedFinalGB} GB
         ${needsSplit ? ` -> ${segmentCount} parts`
           + ` (<= ${(state.maxSegmentBytes / 1024 / 1024 / 1024).toFixed(0)} GB`
-          + ` & <= ${Math.floor((state.maxSegmentSeconds || 43200) / 3600)} h each)` : ''}
+          + ` or <= ${Math.floor((state.maxSegmentSeconds || 43200) / 3600)} h each)` : ''}
       </div>
     `;
     if (state.partialOutputPath) {

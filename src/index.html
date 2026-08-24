@@ -835,11 +835,11 @@
       <div class="merge-controls" id="dc-split-options" style="margin-left:22px;margin-top:4px">
         <label>
           Max file size:
-          <input type="number" id="dc-max-gb" value="256" min="1" max="1000" style="width:70px"> GB
+          <input type="number" id="dc-max-gb" value="512" min="1" max="4000" style="width:70px"> GB
         </label>
         <label style="margin-left:14px">
           Max duration:
-          <input type="number" id="dc-max-hours" value="12" min="1" max="48" style="width:60px"> hours
+          <input type="number" id="dc-max-hours" value="24" min="1" max="48" style="width:60px"> hours
         </label>
       </div>
     </div>
@@ -1006,14 +1006,14 @@
       <div class="merge-controls">
         <label>
           Max file size:
-          <input type="number" id="sp-max-gb" value="256" min="1" max="1000" style="width:70px"> GB
+          <input type="number" id="sp-max-gb" value="512" min="1" max="4000" style="width:70px"> GB
         </label>
         <label style="margin-left:14px">
           Max duration:
-          <input type="number" id="sp-max-hours" value="12" min="1" max="48" style="width:60px"> hours
+          <input type="number" id="sp-max-hours" value="24" min="1" max="48" style="width:60px"> hours
         </label>
       </div>
-      <div class="hint">A file is only split when it exceeds BOTH the size and duration limits. Raise either limit to keep large or long files intact.</div>
+      <div class="hint">A file will be split into however many parts are needed so that no part exceeds either limit. Default: 512 GB or 24 hours.</div>
     </div>
 
     <div class="card">
