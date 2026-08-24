@@ -7,8 +7,11 @@
     "start": "electron .",
     "extract": "node extract.js",
     "test": "node extract.js",
-    "pack": "electron-builder --win nsis --x64",
-    "dist": "electron-builder --win nsis --x64 --publish never"
+    "fetch:ffmpeg": "node scripts/download-ffmpeg.js",
+    "prepack": "node scripts/download-ffmpeg.js",
+    "dist": "electron-builder --win nsis --x64 --publish never",
+    "predist": "node scripts/download-ffmpeg.js",
+    "pack": "electron-builder --win nsis --x64"
   },
   "keywords": [
     "gopro",

@@ -283,6 +283,8 @@ gopro-dashcam-tool/
 ├── merge_*.ps1          # PowerShell helpers (legacy)
 ├── start-gui.bat        # Launch Electron app
 ├── start_fast_merge.bat # Launch fast_merge.py
+├── scripts/
+│   └── download-ffmpeg.js  # Downloads ffmpeg.exe + ffprobe.exe into resources/ at build time
 └── package.json
 ```
 
@@ -291,13 +293,20 @@ gopro-dashcam-tool/
 `ffmpeg.exe` and `ffprobe.exe` are bundled with the installer, so **end users don't need any pre-installed tooling** (no Node.js, no ffmpeg, no PATH setup).
 
 ```bash
-# One-time: install electron-builder
+# One-time: install dependencies (electron-builder, etc.)
 npm install
 
-# Build a Windows NSIS installer (~80 MB)
+# Build a Windows NSIS installer (~125 MB)
 npm run dist
 # → dist/GoPro Dashcam Tool-Setup-1.0.0.exe
 ```
+
+The `predist` hook automatically runs `scripts/download-ffmpeg.js`, which fetches `ffmpeg.exe` + `ffprobe.exe` from gyan.dev's Windows essentials build (~106 MB ZIP, GPLv3 static build) and verifies the SHA256 checksum. No manual setup required.
+
+**Override the download** with environment variables:
+- `FFMPEG_VERSION=8.1.2` — pin a different gyan.dev release
+- `FFMPEG_URL=https://...zip` — use any custom ZIP containing ffmpeg + ffprobe
+- `FFMPEG_USE_SYSTEM=1` — copy from system PATH (faster, version not guaranteed)
 
 End users just double-click the `.exe`, pick an install folder, done. The installer:
 - Installs `GoPro Dashcam Tool` to `%LocalAppData%\Programs\GoPro Dashcam Tool\`

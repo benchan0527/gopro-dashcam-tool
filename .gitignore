@@ -70,3 +70,10 @@ part*.ts
 
 # ===== Electron-builder output =====
 dist/
+
+# ===== ffmpeg binaries (downloaded by scripts/download-ffmpeg.js at build time) =====
+# The download script writes these to resources/ on demand; we don't commit them.
+resources/ffmpeg.exe
+resources/ffprobe.exe
+# And any leftover staging dirs from interrupted downloads:
+resources/_dl-*/
