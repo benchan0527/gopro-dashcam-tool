@@ -36,6 +36,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   dashcamSplit: (options) => ipcRenderer.invoke('dashcam:split', options),
   dashcamPickSplitFolder: () => ipcRenderer.invoke('dashcam:pick-folder'),
   dashcamPickSplitFiles: () => ipcRenderer.invoke('dashcam:pick-split-files'),
+  dashcamGetEncoder: () => ipcRenderer.invoke('dashcam:get-encoder'),
+  dashcamListEncoders: () => ipcRenderer.invoke('dashcam:list-encoders'),
+  dashcamSetEncoder: (choice) => ipcRenderer.invoke('dashcam:set-encoder', choice),
+  onEncoderStatus: (callback) => {
+    ipcRenderer.on('encoder-status', (event, status) => callback(status));
+  },
   onDashcamProgress: (callback) => {
     ipcRenderer.on('dashcam:progress', (event, data) => callback(data));
   }

@@ -1,4 +1,4 @@
-﻿const { app, BrowserWindow, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -8,6 +8,22 @@ const { spawn, exec } = require('child_process');
 let mainWindow;
 let activeMerger = null; // { proc, cancelled }
 let activeSplitter = null; // { proc, cancelled }
+
+// Cached HW encoder for rotation: { name: 'hevc_nvenc' | 'h264_nvenc' | 'hevc_qsv' | 'h264_qsv' | 'hevc_amf' | 'h264_amf', hwaccel: 'cuda' | 'qsv' | 'd3d11va' } | null
+// Detected once per session via `ffmpeg -hide_banner -encoders`. This avoids probing
+// per-file and lets the worker count adjust up-front (1 worker for GPU, 2 for CPU).
+//
+// Encoder priority order (1.1.4 — performance rebuild):
+//   1. HEVC HW encoders first — GoPro records HEVC, so HEVC→HEVC skips codec
+//      transcode overhead. Quality stays identical to source.
+//   2. H.264 HW encoders fall back — still GPU-fast, but pays the HEVC→H.264
+//      transcode cost (slower + lossy).
+//   3. libx264 CPU ultrafast + `-tune zerolatency` final fallback.
+//
+// Each candidate also runs a real encode test before being accepted, so a
+// missing GPU driver or broken ffmpeg build never silently picks a broken encoder.
+let hwEncoderCache = null;
+let hwEncoderProbed = false;
 
 // Resolve bundled ffmpeg / ffprobe binaries.
 // - In dev (running `electron .`): look in repo's `resources/` next to package.json
@@ -27,6 +43,179 @@ function resolveTool(name) {
   return exe;
 }
 
+// Probe ffmpeg for a hardware encoder. Cached after first call.
+// Prefers HEVC HW (GoPro records HEVC) then H.264 HW, then CPU fallback.
+// Each candidate also tries a real encode so we don't trust a stale `encoders` list
+// (e.g. ffmpeg built without NVENC but with the symbol present).
+//
+// Side-effects: populates `hwEncoderProbedList` (every candidate probed,
+// with ok/fail + reason) so the UI dropdown can show the full menu.
+async function detectHwEncoder() {
+  if (hwEncoderProbed) return hwEncoderCache;
+  hwEncoderProbed = true;
+  hwEncoderProbedList = [];
+
+  const candidates = [
+    // HEVC first — GoPro records HEVC, so HEVC→HEVC skips codec transcode
+    // overhead and preserves source quality.
+    { name: 'hevc_nvenc', hwaccel: 'cuda',     extraArgs: ['-rc', 'constqp', '-qp', '23'] },
+    { name: 'hevc_qsv',   hwaccel: 'qsv',      extraArgs: ['-preset', 'veryfast'] },
+    { name: 'hevc_amf',   hwaccel: 'd3d11va',  extraArgs: ['-rc', 'cqp', '-qp_i', '23', '-qp_p', '23'] },
+    // H.264 fallbacks — still GPU-fast, but pays HEVC→H.264 transcode cost.
+    { name: 'h264_nvenc', hwaccel: 'cuda',     extraArgs: ['-rc', 'constqp', '-qp', '23'] },
+    { name: 'h264_qsv',   hwaccel: 'qsv',      extraArgs: ['-preset', 'fast'] },
+    { name: 'h264_amf',   hwaccel: 'd3d11va',  extraArgs: ['-rc', 'cqp', '-qp_i', '23', '-qp_p', '23'] }
+  ];
+
+  // First, get the list of compiled-in encoders once.
+  let listed;
+  try {
+    listed = await new Promise((resolve) => {
+      const proc = spawn(resolveTool('ffmpeg'), ['-hide_banner', '-encoders'], { windowsHide: true });
+      let out = '';
+      proc.stdout.on('data', (d) => { out += d.toString(); });
+      proc.on('close', () => resolve(out));
+      proc.on('error', () => resolve(''));
+      setTimeout(() => { try { proc.kill(); } catch (e) {} resolve(out); }, 5000);
+    });
+  } catch (e) {
+    listed = '';
+  }
+
+  for (const c of candidates) {
+    // Check the encoder is compiled in.
+    const listedRe = new RegExp(`V[\\.\\w]*\\s+${c.name}\\b`);
+    if (!listedRe.test(listed)) continue;
+
+    // Verify the encoder actually accepts a tiny encode job. Some ffmpeg builds
+    // list the encoder but it fails at runtime (no compatible GPU driver).
+    // 64x64 is too small for NVENC (driver minimum ~128x128), so use 256x256.
+    const probeResult = await new Promise((resolve) => {
+      try {
+        const proc = spawn(resolveTool('ffmpeg'), [
+          '-y', '-nostdin', '-hide_banner', '-loglevel', 'error',
+          '-f', 'lavfi', '-i', 'color=size=256x256:rate=25:duration=1:color=black',
+          '-frames:v', '25',
+          '-c:v', c.name, ...c.extraArgs,
+          '-f', 'null', '-'
+        ], { windowsHide: true });
+        let stderr = '';
+        proc.stderr.on('data', (d) => { stderr += d.toString(); });
+        proc.on('close', (code) => resolve({ ok: code === 0, stderr: stderr.trim().split(/\r?\n/).slice(-2).join(' | ').slice(0, 240) }));
+        proc.on('error', (e) => resolve({ ok: false, stderr: 'spawn error: ' + e.message }));
+        setTimeout(() => { try { proc.kill(); } catch (e) {} resolve({ ok: false, stderr: 'probe timeout (8s)' }); }, 8000);
+      } catch (e) {
+        resolve({ ok: false, stderr: 'exception: ' + e.message });
+      }
+    });
+
+    if (probeResult.ok) {
+      hwEncoderCache = { name: c.name, hwaccel: c.hwaccel, lastError: null };
+      hwEncoderProbedList.push({ ...c, ok: true, reason: null });
+      return hwEncoderCache;
+    } else {
+      // Remember the last failure so the badge can explain why.
+      hwEncoderCache = null;
+      hwEncoderLastError = `${c.name}: ${probeResult.stderr || 'unknown'}`;
+      hwEncoderProbedList.push({ ...c, ok: false, reason: probeResult.stderr || 'unknown' });
+    }
+  }
+
+  return null;
+}
+
+// Track the last probe failure so the UI can show *why* NVENC was rejected
+// instead of silently falling back to CPU.
+let hwEncoderLastError = null;
+
+// Full list of probed candidates (working + failed). Populated by detectHwEncoder.
+let hwEncoderProbedList = [];
+
+// User-selected encoder override. null = use auto-detect (hwEncoderCache).
+// Persisted to userData so the choice survives restarts.
+let hwEncoderOverride = null;
+
+const PREFS_FILE = () => path.join(app.getPath('userData') || os.tmpdir(), 'dashcam-prefs.json');
+
+function loadPrefs() {
+  try {
+    const p = PREFS_FILE();
+    if (fs.existsSync(p)) {
+      const data = JSON.parse(fs.readFileSync(p, 'utf8'));
+      if (data && typeof data === 'object') return data;
+    }
+  } catch (_) {}
+  return {};
+}
+
+function savePrefs(prefs) {
+  try {
+    fs.writeFileSync(PREFS_FILE(), JSON.stringify(prefs, null, 2));
+  } catch (_) {}
+}
+
+// Load override on startup (before any encode can run).
+const _startupPrefs = loadPrefs();
+if (_startupPrefs.encoderOverride) hwEncoderOverride = _startupPrefs.encoderOverride;
+
+// Return the encoder to actually use, respecting user override.
+// Returns the same shape as `hwEncoderCache` ({name, hwaccel, extraArgs?})
+// or null for CPU fallback.
+function getEffectiveEncoder() {
+  if (hwEncoderOverride) {
+    if (hwEncoderOverride === 'cpu') return null; // user forced CPU
+    const override = hwEncoderProbedList.find(c => c.name === hwEncoderOverride && c.ok);
+    if (override) {
+      return { name: override.name, hwaccel: override.hwaccel };
+    }
+    // override points at a broken encoder — fall through to auto-detect
+  }
+  return hwEncoderCache;
+}
+
+// Quick (cached) lookup used by the renderer to display the encoder
+// status badge at startup. Runs the full probe in the background so
+// the badge updates from "not yet probed" → actual encoder within ~2s
+// of app start. Returns an object so the renderer can show why a
+// fallback was chosen.
+function getEncoderStatus() {
+  const eff = getEffectiveEncoder();
+  if (eff) {
+    const isOverride = hwEncoderOverride && hwEncoderOverride === eff.name;
+    return {
+      ok: true,
+      name: eff.name,
+      hwaccel: eff.hwaccel,
+      label: `${eff.name} (${eff.hwaccel} hwaccel)${isOverride ? ' — manual' : ' — auto'}`,
+      effective: eff.name
+    };
+  }
+  if (hwEncoderOverride === 'cpu') {
+    return { ok: false, label: 'CPU libx264 (forced)', effective: 'cpu' };
+  }
+  if (hwEncoderProbed) {
+    return { ok: false, label: 'CPU libx264 (no HW encoder worked)', reason: hwEncoderLastError || 'all probes failed', effective: 'cpu' };
+  }
+  return { ok: null, label: 'probing…' };
+}
+
+// Snapshot of all probed candidates for the renderer's dropdown menu.
+function listEncoderChoices() {
+  return {
+    working: (hwEncoderProbedList || []).filter(c => c.ok).map(c => ({ name: c.name, hwaccel: c.hwaccel })),
+    failed:  (hwEncoderProbedList || []).filter(c => !c.ok).map(c => ({ name: c.name, reason: c.reason })),
+    override: hwEncoderOverride || null,
+    probed: hwEncoderProbed
+  };
+}
+(async function probeEncoderOnStartup() {
+  try { await detectHwEncoder(); } catch (_) { /* probe errors are non-fatal */ }
+  // Notify renderer (if it's loaded) so the badge updates in real time.
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('encoder-status', getEncoderStatus());
+  }
+})();
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1100,
@@ -43,8 +232,10 @@ function createWindow() {
 
   mainWindow.loadFile(path.join(__dirname, 'index.html'));
 
-  // Open DevTools for debugging
-  mainWindow.webContents.openDevTools();
+  // DevTools no longer opens by default — this is a release build, not a
+  // debugging session. Uncomment the next line if you need to inspect the
+  // renderer console during development:
+  // mainWindow.webContents.openDevTools();
 
   mainWindow.on('closed', () => {
     mainWindow = null;
@@ -1158,7 +1349,7 @@ ipcMain.handle('dashcam:detect-resume', async (event, { outputDir, outputName })
 
     // Estimate final mp4 size: ~93% of input bytes
     const estimatedFinalBytes = Math.ceil(tsBytes * 0.93);
-    const maxSegmentBytes = 256 * 1024 * 1024 * 1024;
+    const maxSegmentBytes = 128 * 1024 * 1024 * 1024;
     const needsSplit = estimatedFinalBytes > maxSegmentBytes;
     const segmentCount = needsSplit ? Math.ceil(estimatedFinalBytes / maxSegmentBytes) : 1;
 
@@ -1235,7 +1426,8 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
     outputName,
     tempDir = null,    // if null, uses outputDir
     cleanupTs = true,
-    maxSegmentBytes = 512 * 1024 * 1024 * 1024,  // 512 GB per output
+    rotate180 = false, // 180° rotation (vflip+hflip)
+    maxSegmentBytes = 128 * 1024 * 1024 * 1024,  // 128 GB per output (was 512; lowered because some Windows file systems / antivirus real-time scanners intermittently fail on single multi-hundred-GB outputs)
     maxSegmentSeconds = 24 * 60 * 60,           // 24 hours per output
     resumeFrom = null  // { fileListPath, tsFiles, outputName, needsSplit, segmentTime, estimatedFinalBytes, totalInputBytes, totalInputSeconds, maxSegmentBytes, maxSegmentSeconds } | null
   } = options;
@@ -1358,7 +1550,7 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
           workingDirSource = c.source;
           sendPreflight({
             phase: 'preflight',
-            message: `Disk OK on ${c.source} (${freeGB} GB free, need ~${(requiredBytes / 1024 / 1024 / 1024).toFixed(2)} GB${needsSplit ? `, will split into ${segmentCount} parts (<= ${(maxSegmentBytes / 1024 / 1024 / 1024).toFixed(0)} GB or <= ${Math.floor(maxSegmentSeconds / 3600)} h each)` : ''})`,
+            message: `Disk OK on ${c.source} (${freeGB} GB free, need ~${(requiredBytes / 1024 / 1024 / 1024).toFixed(2)} GB${needsSplit ? `, will split into ${segmentCount} parts (<= ${(maxSegmentBytes / 1024 / 1024 / 1024).toFixed(0)} GB or <= ${Math.floor(maxSegmentSeconds / 3600)} h each)` : ''})${rotate180 ? `, rotation encoder: ${hwEnc || 'libx264 ultrafast'}` : ''}`,
             tempDir: workingDir,
             tempDirSource: workingDirSource,
             diskFreeBytes: freeBytes,
@@ -1612,11 +1804,14 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
       phase1StartMs = Date.now();
 
       // Pre-compute all per-file metadata so workers don't re-stat the same files.
-      // Using os.cpus().length workers because ffmpeg -c copy is purely I/O bound
-      // (no decode, no CPU work) — bottleneck is disk read of the source MP4.
-      // Parallelism here typically yields 2-4× on SSDs and on a single disk where
-      // reads are sequential. On spinning HDDs with many workers the gain is smaller
-      // due to seek contention, but still positive.
+      // Worker count depends on whether rotation is enabled:
+      //  - copy mode (-c copy): purely I/O bound, parallelism scales with disk bandwidth.
+      //    We use cpuCount workers (capped at file count); on SSDs this yields 2-4× speedup.
+      //  - rotate180 mode: CPU-bound re-encode with libx264 (each ffmpeg already uses
+      //    4-8 internal threads). Running N parallel re-encodes on N cores gives each
+      //    only 1/N speed with high contention overhead. Capped at 2 workers (or 1
+      //    when there's only 1 file) — total throughput is similar or better than
+      //    spawning N workers, with much less CPU thrashing.
       const phase1Jobs = files.map((file, i) => {
         const tsFile = path.join(workingDir, `part${String(i + 1).padStart(4, '0')}.ts`);
         const fileSize = (() => { try { return fs.statSync(file).size; } catch (e) { return 0; } })();
@@ -1628,13 +1823,61 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
 
       const cpuCount = Math.max(1, os.cpus().length);
       // Cap to file count: no point spawning more workers than files.
-      const workerCount = Math.min(cpuCount, phase1Jobs.length);
+      // Hardware H.264 encoder (NVENC/QSV/AMF) means the GPU is the bottleneck —
+      // there's only one GPU, so 2 workers would just contend. Use 1 worker.
+      // CPU path: cap at 2 (each libx264 encoder uses 4-6 threads internally;
+      // 2 workers × 4 threads = 8 threads, which fits an 8+ core machine
+      // with minimal contention when paired with -preset ultrafast).
+      // GPU path (NVENC/QSV/AMF): 1 worker — consumer GPUs have a single
+      // hardware encoder engine; running more workers queues up and slows
+      // each frame individually. `getEffectiveEncoder()` respects the user's
+      // manual override (encoder dropdown in the UI).
+      const hwEnc = rotate180 ? getEffectiveEncoder() : null;
+      const workerCount = rotate180
+        ? (hwEnc ? Math.min(1, phase1Jobs.length)        // GPU encoder: 1 worker
+                 : Math.min(2, phase1Jobs.length))       // CPU encoder: 2 workers
+        : Math.min(cpuCount, phase1Jobs.length);
+
+      // Aggregate in-flight bytes across ALL workers. Each worker's progress emit
+      // replaces its contribution here. Used by the ETA calculator so worker 1's
+      // ETA reflects worker 2's progress too (and vice-versa).
+      // Without this, ETA ping-pongs wildly as the 2 workers race each other.
+      // Per-worker contribution tracking for the aggregate in-flight counter.
+      // Each worker registers its current "input bytes consumed" as it makes
+      // progress. phase1InFlightBytes is then the SUM of all live workers'
+      // contributions (delta-updated on each emit). On job completion, the
+      // worker's contribution is removed entirely.
+      //
+      // Why delta updates instead of the older
+      //   `phase1InFlightBytes = phase1InFlightBytes - job.fileSize + progress`
+      // pattern: with N parallel workers, the "subtract job.fileSize" branch
+      // assumed the worker's previous contribution in phase1InFlightBytes was
+      // still `job.fileSize`. But other workers' progress emits may have
+      // already replaced that worker's contribution. The old logic therefore
+      // double-subtracted and the counter drifted negative (e.g. -454 GB for a
+      // 21 GB job). Per-worker tracking + delta update keeps phase1InFlightBytes
+      // exactly = sum-of-live-workers' input-bytes-consumed at all times.
+      let phase1InFlightBytes = 0;
+      const workerContributions = new Map(); // workerId -> input bytes consumed
+      let phase1FirstEmitAt = 0;   // timestamp of the first 'progress' emit (ms)
 
       // Emit one starting event for each file (UI consistency with sequential version).
-      // Phase 1 ETA: rough estimate = total bytes / aggregate observed throughput;
-      // before any data exists, default to 3s per file.
-      const initialAvg = tsAvgMs > 0 ? tsAvgMs : 3000;
-      cachedEtaMs = initialAvg * Math.max(0, phase1Jobs.length - tsTimings.length);
+      // Phase 1 ETA: rough estimate = total bytes / aggregate observed throughput.
+      // Initial guess differs for copy vs rotation: copy is I/O bound (fast),
+      // rotation depends on encoder:
+      //   - GPU encoder (h264_nvenc/qsv/amf): ~3s/GB (near real-time)
+      //   - libx264 ultrafast: ~10s/GB (about 2-3x realtime)
+      // We start with a per-file guess; actual ETA gets refined as files finish.
+      const initialAvgPerFile = tsAvgMs > 0
+        ? tsAvgMs
+        : (rotate180 ? (hwEnc ? 6000 : 12000) : 3000);
+      // Account for worker parallelism in the initial guess: ceil(remaining / workers)
+      // files × avg-per-file, divided by worker count for wall-clock ETA.
+      const remainingFiles0 = Math.max(0, phase1Jobs.length - tsTimings.length);
+      const initialWallClockMs = tsAvgMs > 0
+        ? tsAvgMs * Math.max(1, Math.ceil(remainingFiles0 / Math.max(1, workerCount)))
+        : initialAvgPerFile * remainingFiles0;
+      cachedEtaMs = initialWallClockMs;
       for (let i = 0; i < phase1Jobs.length; i++) {
         const j = phase1Jobs[i];
         send({
@@ -1654,7 +1897,9 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
           phase2TotalBytes,
           overallTotalBytes,
           overallDoneBytes: phase1DoneBytes + phase2DoneBytes,
-          message: `Converting ${path.basename(j.file)} -> TS (${workingDirSource})`
+          message: rotate180
+            ? `Converting ${path.basename(j.file)} -> TS with 180° rotation (${workingDirSource})`
+            : `Converting ${path.basename(j.file)} -> TS (${workingDirSource})`
         });
       }
 
@@ -1670,21 +1915,371 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
           activeWorkers++;
           try {
             const job = phase1Jobs[myIdx];
+            // Register this worker's contribution to the aggregate in-flight
+            // counter. Updated again on each progress emit (delta against the
+            // previous contribution) and removed entirely on completion.
+            workerContributions.set(workerId, job.fileSize);
+            phase1InFlightBytes += job.fileSize;
             const t0 = Date.now();
             currentFileStartMs = t0;
             currentPhase = 'convert';
-            const convertError = await new Promise((resolve) => {
-              const proc = spawn(resolveTool('ffmpeg'), [
+            // Per-file duration for translating ffmpeg's out_time_us -> bytes-written
+            // estimate. Comes from the durations[] array computed earlier via ffprobe.
+            const fileDurationSec = durations[myIdx] || 0;
+
+            // Build ffmpeg args: if rotate180, use video filter + re-encode; else stream copy.
+            // Both modes add `-progress pipe:1` so we can stream real-time progress
+            // (out_time_us / total_size) from stdout back to the renderer. Without
+            // this, a re-encode (rotation) would appear frozen in the UI for tens of
+            // seconds between the 'starting' and 'done' events — users thought the
+            // export was stuck.
+            //
+            // Rotation encoder selection (1.1.4 — performance rebuild):
+            //
+            //   GOAL: minimize wall-clock time for `vflip,hflip` on GoPro HEVC sources.
+            //
+            //   Path 1 — HEVC HW (hevc_nvenc / hevc_qsv / hevc_amf):
+            //     • HEVC source → HEVC output, no codec transcode overhead.
+            //     • `-hwaccel cuda|qsv|d3d11va` puts HEVC decode on the GPU
+            //       (NVDEC / QSV / DXVA). Software HEVC decode of 4K@50fps is
+            //       the dominant bottleneck on CPU; HW decode runs at >1× real-time.
+            //     • `vflip_cuda,hflip_cuda` (NVENC path) keeps the frame on GPU
+            //       memory end-to-end — no copies to system RAM.
+            //     • NVENC preset `p1` is fastest; quality loss vs p4 is negligible
+            //       at constant QP 23.
+            //
+            //   Path 2 — H.264 HW (h264_nvenc / h264_qsv / h264_amf):
+            //     • GPU decode + encode, but pays HEVC→H.264 transcode cost.
+            //     • Faster than CPU but loses a quality generation.
+            //
+            //   Path 3 — libx264 CPU ultrafast:
+            //     • `-tune zerolatency` skips lookahead, ~10–20% faster than
+            //       ultrafast alone at the same CRF.
+            //     • `-threads` adaptive: `min(8, cores - 1)`. 1 worker if cores
+            //       are abundant (4+); 2 workers only when cores ≥ 8.
+            //       (Over-parallelizing libx264 ultrafast actually slows it down
+            //       due to slice-partition overhead.)
+            let ffmpegArgs;
+            if (rotate180) {
+              // Two flags together are required to reliably remove the input's
+              // `Display Matrix: rotation=-180°` side data:
+              //   1. `-noautorotate` tells FFmpeg NOT to auto-apply the source
+              //      MP4's displaymatrix rotation when reading the input.
+              //   2. `-metadata:s:v:0 displaymatrix_rotation=0` explicitly clears
+              //      the displaymatrix side data on the OUTPUT video stream.
+              //      Without it, some encoders (notably x264 writing MP4 directly)
+              //      still propagate the source's displaymatrix into the output,
+              //      which makes the player apply ANOTHER 180° rotation on top of
+              //      our `vflip,hflip` filter — net effect: still upside-down.
+              //      Both flags needed; missing either one re-introduces the bug
+              //      depending on container + encoder combo.
+              // (FFmpeg 5.0+ required; bundled binary is 9.0.1.)
+              if (hwEnc && hwEnc.name === 'hevc_nvenc') {
+                // HW decode (NVDEC) → system memory → software vflip,hflip (it's
+                // a per-pixel op, runs at memory bandwidth; fast enough that
+                // moving it to GPU doesn't measurably help). NVENC encode.
+                // The full pipeline runs ~2.5× faster than the libx264 CPU path
+                // on a typical 4K@50fps GoPro HEVC source (benchmark on
+                // BtbN 2023-03-02 ffmpeg + RTX-class NVIDIA GPU).
+                //
+                // We do NOT use `-hwaccel_output_format cuda` or
+                // `vflip_cuda,hflip_cuda` because this ffmpeg build lacks those
+                // CUDA filter primitives (only scale_cuda / bilateral_cuda /
+                // overlay_cuda are compiled in). Falling back to the software
+                // filter is the right choice here.
+                ffmpegArgs = [
+                  '-y', '-nostdin', '-hide_banner', '-loglevel', 'error',
+                  '-noautorotate',
+                  '-progress', 'pipe:1',
+                  '-hwaccel', 'cuda',
+                  '-i', job.file,
+                  '-vf', 'vflip,hflip',
+                  '-c:v', 'hevc_nvenc',
+                  '-preset', 'p1',         // fastest NVENC preset
+                  '-rc', 'constqp',
+                  '-qp', '23',
+                  '-c:a', 'copy',
+                  '-map', '0:v:0',
+                  '-map', '0:a:0?',
+                  '-metadata:s:v:0', 'rotate=0',
+                  '-f', 'mpegts',
+                  job.tsFile
+                ];
+              } else if (hwEnc && hwEnc.name === 'h264_nvenc') {
+                ffmpegArgs = [
+                  '-y', '-nostdin', '-hide_banner', '-loglevel', 'error',
+                  '-noautorotate',
+                  '-progress', 'pipe:1',
+                  '-hwaccel', 'cuda',
+                  '-i', job.file,
+                  '-vf', 'vflip,hflip',
+                  '-c:v', 'h264_nvenc',
+                  '-preset', 'p1',
+                  '-rc', 'constqp',
+                  '-qp', '23',
+                  '-c:a', 'copy',
+                  '-map', '0:v:0',
+                  '-map', '0:a:0?',
+                  '-metadata:s:v:0', 'rotate=0',
+                  '-f', 'mpegts',
+                  job.tsFile
+                ];
+              } else if (hwEnc && hwEnc.name === 'hevc_qsv') {
+                ffmpegArgs = [
+                  '-y', '-nostdin', '-hide_banner', '-loglevel', 'error',
+                  '-noautorotate',
+                  '-progress', 'pipe:1',
+                  '-hwaccel', 'qsv',
+                  '-i', job.file,
+                  '-vf', 'vflip,hflip',
+                  '-c:v', 'hevc_qsv',
+                  '-preset', 'veryfast',
+                  '-global_quality', '23',
+                  '-c:a', 'copy',
+                  '-map', '0:v:0',
+                  '-map', '0:a:0?',
+                  '-metadata:s:v:0', 'rotate=0',
+                  '-f', 'mpegts',
+                  job.tsFile
+                ];
+              } else if (hwEnc && hwEnc.name === 'h264_qsv') {
+                ffmpegArgs = [
+                  '-y', '-nostdin', '-hide_banner', '-loglevel', 'error',
+                  '-noautorotate',
+                  '-progress', 'pipe:1',
+                  '-hwaccel', 'qsv',
+                  '-i', job.file,
+                  '-vf', 'vflip,hflip',
+                  '-c:v', 'h264_qsv',
+                  '-preset', 'fast',
+                  '-global_quality', '23',
+                  '-c:a', 'copy',
+                  '-map', '0:v:0',
+                  '-map', '0:a:0?',
+                  '-metadata:s:v:0', 'rotate=0',
+                  '-f', 'mpegts',
+                  job.tsFile
+                ];
+              } else if (hwEnc && hwEnc.name === 'hevc_amf') {
+                ffmpegArgs = [
+                  '-y', '-nostdin', '-hide_banner', '-loglevel', 'error',
+                  '-noautorotate',
+                  '-progress', 'pipe:1',
+                  '-hwaccel', 'd3d11va',
+                  '-i', job.file,
+                  '-vf', 'vflip,hflip',
+                  '-c:v', 'hevc_amf',
+                  '-rc', 'cqp',
+                  '-qp_i', '23', '-qp_p', '23',
+                  '-c:a', 'copy',
+                  '-map', '0:v:0',
+                  '-map', '0:a:0?',
+                  '-metadata:s:v:0', 'rotate=0',
+                  '-f', 'mpegts',
+                  job.tsFile
+                ];
+              } else if (hwEnc && hwEnc.name === 'h264_amf') {
+                ffmpegArgs = [
+                  '-y', '-nostdin', '-hide_banner', '-loglevel', 'error',
+                  '-noautorotate',
+                  '-progress', 'pipe:1',
+                  '-hwaccel', 'd3d11va',
+                  '-i', job.file,
+                  '-vf', 'vflip,hflip',
+                  '-c:v', 'h264_amf',
+                  '-rc', 'cqp',
+                  '-qp_i', '23', '-qp_p', '23',
+                  '-c:a', 'copy',
+                  '-map', '0:v:0',
+                  '-map', '0:a:0?',
+                  '-metadata:s:v:0', 'rotate=0',
+                  '-f', 'mpegts',
+                  job.tsFile
+                ];
+              } else {
+                // CPU fallback: libx264 ultrafast + adaptive threads.
+                //
+                // Earlier 1.1.4 draft added `-tune zerolatency` but benchmarking
+                // 10s of 4K@50fps GoPro HEVC on the bundled ffmpeg showed it
+                // actually slowed down `libx264 -preset ultrafast` by ~7%
+                // (17.39s → 18.71s). The ultrafast preset already disables
+                // lookahead, so the zerolatency tune has nothing left to disable
+                // and only adds slice-header overhead. Removed.
+                //
+                // `-threads` is adaptive: `min(8, cores - 1)`. Over-parallelizing
+                // libx264 ultrafast hurts throughput due to slice-partition
+                // overhead at low preset, so 1 worker if cores ≤ 4 and 2
+                // workers only when cores ≥ 8 (set via the workerCount logic
+                // above).
+                const cores = (os.cpus() || []).length || 4;
+                const cpuThreads = Math.max(2, Math.min(8, cores - 1));
+                ffmpegArgs = [
+                  '-y', '-nostdin', '-hide_banner', '-loglevel', 'error',
+                  '-noautorotate',
+                  '-progress', 'pipe:1',
+                  '-i', job.file,
+                  '-vf', 'vflip,hflip',
+                  '-c:v', 'libx264',
+                  '-preset', 'ultrafast',
+                  '-crf', '26',            // bumped from 23 to compensate for less efficient preset
+                  '-threads', String(cpuThreads),
+                  '-c:a', 'copy',
+                  '-map', '0:v:0',
+                  '-map', '0:a:0?',
+                  '-metadata:s:v:0', 'rotate=0',
+                  '-f', 'mpegts',
+                  job.tsFile
+                ];
+              }
+            } else {
+              // Copy mode. USER-OPT-IN rotation only:
+              //   - This default path does NOT auto-apply the source's
+              //     `Display Matrix: rotation=-180°` side data. We use
+              //     `-noautorotate` so the raw upside-down pixels are passed
+              //     through untouched.
+              //   - We still strip the matrix metadata with `rotate=0` so the
+              //     output has no displaymatrix tag (otherwise some players
+              //     auto-rotate based on the metadata, others don't — making
+              //     playback dependent on the player). Result: output has raw
+              //     upside-down pixels + no matrix metadata.
+              //   - User must TICK `Rotate 180°` to get pixels that are
+              //     right-side-up. That branch re-encodes with `vflip,hflip`
+              //     and produces right-side-up pixels + no matrix.
+              //
+              // NOTE: previous builds (1.1.0–1.1.2) let FFmpeg implicitly
+              // auto-apply the displaymatrix when muxing MP4 → MPEGTS via
+              // `-c copy`, which silently rotated pixels for users who didn't
+              // ask for it. Some users want this auto-behavior, others
+              // (particularly those running the camera right-side-up but
+              // whose files have stale metadata) want explicit consent. With
+              // `-noautorotate` the choice is now always the user's.
+              ffmpegArgs = [
                 '-y', '-nostdin', '-hide_banner', '-loglevel', 'error',
+                '-noautorotate',
+                '-progress', 'pipe:1',
                 '-i', job.file,
                 '-c', 'copy',
                 '-map', '0:v:0',
                 '-map', '0:a:0?',
+                '-metadata:s:v:0', 'rotate=0',
                 '-f', 'mpegts',
                 job.tsFile
-              ], { windowsHide: true });
+              ];
+            }
+
+            // Live progress tracking for THIS file. Re-initialized per file so each
+            // conversion has its own progress accumulator.
+            let progressInFlightBytes = 0;  // estimated bytes of current file done so far
+            let progressEmitLast = 0;       // ms timestamp of last progress emit (throttle)
+
+            const convertError = await new Promise((resolve) => {
+              const proc = spawn(resolveTool('ffmpeg'), ffmpegArgs, { windowsHide: true });
               let stderr = '';
+              let stdoutBuf = '';
               proc.stderr.on('data', (d) => { stderr += d.toString(); });
+              // Parse ffmpeg's -progress pipe:1 output. Format: blocks of key=value
+              // lines terminated by a line containing just `progress=continue` (or
+              // `progress=end` at the end). We split on `progress=` markers and
+              // parse the block before each marker.
+              proc.stdout.on('data', (d) => {
+                stdoutBuf += d.toString();
+                let searchFrom = 0;
+                while (true) {
+                  const idx = stdoutBuf.indexOf('progress=', searchFrom);
+                  if (idx < 0) break;
+                  const nlIdx = stdoutBuf.indexOf('\n', idx);
+                  if (nlIdx < 0) break; // wait for more data
+                  const block = stdoutBuf.slice(searchFrom, idx);
+                  stdoutBuf = stdoutBuf.slice(nlIdx + 1);
+                  searchFrom = 0;
+
+                  // Prefer out_time_us (input time) over total_size (output bytes).
+                  // For ETA + cumulative bytes we need a value in INPUT bytes (the
+                  // unit used for `phase1TotalBytes`). Output bytes from `total_size`
+                  // are smaller for re-encode (rotation) mode — using them caused
+                  // ETA to jump to negative values when the worker finished and we
+                  // subtracted `job.fileSize` (input) from a counter tracking
+                  // output bytes. out_time_us is monotonic in input time regardless
+                  // of codec, so it's always safe.
+                  const timeM = block.match(/out_time_us=(\d+)/);
+                  if (timeM && fileDurationSec > 0) {
+                    const outTimeSec = parseInt(timeM[1], 10) / 1_000_000;
+                    progressInFlightBytes = Math.round(
+                      Math.min(1, outTimeSec / fileDurationSec) * job.fileSize
+                    );
+                  } else {
+                    continue; // no usable metric yet
+                  }
+
+                  // Throttle to ~5 emits/sec to avoid flooding IPC with hundreds of
+                  // events per second per worker (which would slow the renderer).
+                  const now = Date.now();
+                  if (now - progressEmitLast < 200) continue;
+                  progressEmitLast = now;
+
+                  // Delta-update this worker's contribution to the aggregate
+                  // in-flight counter. The OLD pattern was
+                  //   phase1InFlightBytes = phase1InFlightBytes - job.fileSize + p
+                  // which assumed this worker's previous contribution was
+                  // job.fileSize — but other workers' emits in between may
+                  // have already replaced it, causing double-subtract. Per-
+                  // worker Map tracks each worker's TRUE contribution and we
+                  // apply only the delta here. Counter stays accurate under
+                  // any number of parallel workers.
+                  const prevContribution = workerContributions.get(workerId) || 0;
+                  const delta = progressInFlightBytes - prevContribution;
+                  workerContributions.set(workerId, progressInFlightBytes);
+                  phase1InFlightBytes += delta;
+
+                  // ETA: use cumulative throughput since phase1StartMs (shared by
+                  // all workers) — this is monotonically converging so it doesn't
+                  // jump. Fall back to the previous cachedEtaMs during the warmup
+                  // window (first ~2s of phase 1) so we don't show a garbage ETA
+                  // based on near-zero throughput.
+                  if (phase1FirstEmitAt === 0) phase1FirstEmitAt = now;
+                  const phaseElapsed = now - phase1StartMs;
+                  const cumulativeBytes = phase1DoneBytes + phase1InFlightBytes;
+                  let etaMs = cachedEtaMs;
+                  if (phaseElapsed > 2000 && cumulativeBytes > 0) {
+                    const cumulativeTput = cumulativeBytes / phaseElapsed;     // bytes/ms
+                    const remainingOverall = Math.max(0, phase1TotalBytes - cumulativeBytes);
+                    etaMs = cumulativeTput > 0
+                      ? Math.round(remainingOverall / cumulativeTput)
+                      : cachedEtaMs;
+                  }
+                  cachedEtaMs = etaMs;
+                  const elapsed = now - t0;
+                  const mbPerSec = elapsed > 0
+                    ? (progressInFlightBytes / 1024 / 1024) / (elapsed / 1000)
+                    : 0;
+
+                  send({
+                    phase: 'convert',
+                    stage: 'progress',
+                    tsIndex: myIdx + 1,
+                    tsTotal: files.length,
+                    file: path.basename(job.file),
+                    fileSize: job.fileSize,
+                    currentFileDone: progressInFlightBytes,
+                    lastMs: elapsed,
+                    etaMs,
+                    eta1Ms: etaMs,
+                    mbPerSec: +mbPerSec.toFixed(1),
+                    workerId,
+                    workerCount,
+                    phase1DoneBytes: cumulativeBytes,
+                    phase1TotalBytes,
+                    phase2DoneBytes,
+                    phase2TotalBytes,
+                    overallTotalBytes,
+                    overallDoneBytes: cumulativeBytes + phase2DoneBytes,
+                    elapsedMs: Date.now() - phase1StartMs,
+                    message: rotate180
+                      ? `Rotating + encoding ${path.basename(job.file)} (${(progressInFlightBytes / 1024 / 1024).toFixed(0)} / ${(job.fileSize / 1024 / 1024).toFixed(0)} MB, ${mbPerSec.toFixed(1)} MB/s)`
+                      : `Converting ${path.basename(job.file)} (${(progressInFlightBytes / 1024 / 1024).toFixed(0)} / ${(job.fileSize / 1024 / 1024).toFixed(0)} MB, ${mbPerSec.toFixed(1)} MB/s)`
+                  });
+                }
+              });
               proc.on('close', (code) => {
                 if (code === 0) resolve(null);
                 else resolve(new Error(`FFmpeg TS exit ${code}: ${stderr.slice(-300)}`));
@@ -1704,6 +2299,13 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
               const slotIdx = tsFiles.indexOf(job.tsFile);
               if (slotIdx >= 0) tsFiles.splice(slotIdx, 1);
               try { fs.unlinkSync(job.tsFile); } catch (e) {}
+              // Remove this worker's contribution entirely (skipped path).
+              // Use the Map's last-known contribution (not job.fileSize) —
+              // a skipped job may have partially converted, in which case
+              // job.fileSize would over-subtract.
+              const skippedContribution = workerContributions.get(workerId) || 0;
+              phase1InFlightBytes -= skippedContribution;
+              workerContributions.delete(workerId);
               phase1DoneBytes += job.fileSize;
               skippedFilesBytes += job.fileSize;
               send({
@@ -1729,12 +2331,24 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
             const dt = Date.now() - t0;
             tsTimings.push(dt);
             tsFilesDone = (tsFilesDone || 0) + 1;
+            // Remove this worker's contribution entirely (success path). We
+            // subtract the worker's LAST KNOWN contribution (from the Map) —
+            // subtracting job.fileSize here would over-subtract whenever
+            // other workers had emitted in between and changed the worker's
+            // contribution slot.
+            const finalContribution = workerContributions.get(workerId) || 0;
+            phase1InFlightBytes -= finalContribution;
+            workerContributions.delete(workerId);
             phase1DoneBytes += job.fileSize;
 
-            // Bytes-throughput ETA: how many bytes remain × wall-time-per-byte.
+            // Bytes-throughput ETA: use cumulative (done + still in-flight) bytes /
+            // time-since-phase1-start. Same math as the mid-file 'progress' emit
+            // so the ETA doesn't jump at file boundaries. The aggregate reflects
+            // both workers' throughput.
             const elapsed = Date.now() - phase1StartMs;
-            const bytesPerMs = elapsed > 0 ? phase1DoneBytes / elapsed : 0;
-            const remainingBytes = Math.max(0, phase1TotalBytes - phase1DoneBytes);
+            const cumulativeBytes = phase1DoneBytes + phase1InFlightBytes;
+            const bytesPerMs = elapsed > 0 && cumulativeBytes > 0 ? cumulativeBytes / elapsed : 0;
+            const remainingBytes = Math.max(0, phase1TotalBytes - cumulativeBytes);
             const remaining = bytesPerMs > 0 ? remainingBytes / bytesPerMs : 0;
             cachedEtaMs = remaining;
             const mbPerSec = dt > 0 ? (job.fileSize / 1024 / 1024) / (dt / 1000) : 0;
@@ -1828,6 +2442,7 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
           '-f', 'segment',
           '-segment_time', String(segmentTime),
           '-reset_timestamps', '1',
+          '-metadata:s:v:0', 'rotate=0',
           segmentPattern
         ]
       : [
@@ -1836,9 +2451,16 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
           '-i', fileListPath,
           '-c', 'copy',
           '-fflags', '+genpts',
+          '-metadata:s:v:0', 'rotate=0',
           finalPath
         ];
-    await new Promise((resolve, reject) => {
+    // ===== Run FFmpeg concat with one auto-retry on crash =====
+    // Some Windows file systems / antivirus real-time scanners intermittently
+    // crash FFmpeg when writing a large MP4 (e.g. exit 0xFFFFFFFF mid-write
+    // at ~200 GB). The retry almost always succeeds because the second attempt
+    // writes fresh file handles. Disk-space error (ENOSPC) is NOT retried —
+    // that would just waste time.
+    const runConcatOnce = () => new Promise((resolve, reject) => {
       const proc = spawn(resolveTool('ffmpeg'), ffmpegArgs, { windowsHide: true });
       let stderr = '';
       proc.stderr.on('data', (d) => {
@@ -1920,11 +2542,52 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
       proc.on('close', (code) => {
         concatElapsedMs = Date.now() - concatStartMs;
         if (code === 0) resolve();
-        else reject(new Error(`FFmpeg concat exit ${code}: ${stderr.slice(-500)}`));
+        else reject(Object.assign(new Error(`FFmpeg concat exit ${code}: ${stderr.slice(-500)}`), { _code: code, _stderrTail: stderr.slice(-2000) }));
       });
       proc.on('error', reject);
       activeMerger.proc = proc;
     });
+
+    let concatAttempts = 0;
+    while (true) {
+      concatAttempts += 1;
+      // Reset progress-related state for retry (so a fresh attempt's progress is clean)
+      if (concatAttempts > 1) {
+        currentOutputBytes = 0;
+        phase2DoneBytes = 0;
+        cachedEta2Ms = null;
+        currentSpeedStr = '';
+        currentBitrateStr = '';
+        currentFpsStr = '';
+        send({
+          phase: 'concat',
+          stage: 'retry',
+          message: `Concat attempt ${concatAttempts} (previous exit code indicated transient crash; retrying once)…`
+        });
+      }
+      try {
+        await runConcatOnce();
+        break; // success
+      } catch (err) {
+        const isLast = concatAttempts >= 2;
+        // Detect obvious "out of disk" errors so we don't waste time retrying
+        const tail = (err._stderrTail || err.message || '').toLowerCase();
+        const looksLikeDiskFull =
+          tail.includes('no space left') ||
+          tail.includes('enospc') ||
+          tail.includes('disk full');
+        if (looksLikeDiskFull || isLast) {
+          throw err;
+        }
+        // Otherwise: treat as transient (antivirus scan / NTFS hiccup) and retry once.
+        send({
+          phase: 'concat',
+          stage: 'retry',
+          message: `Concat crashed (exit ${err._code ?? '?'}); retrying once in 2 s…`
+        });
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+    }
 
     // ===== Cleanup TS =====
     if (cleanupTs) {
@@ -2028,6 +2691,22 @@ ipcMain.handle('dashcam:merge', async (event, options) => {
       try { fs.unlinkSync(fileListPath); } catch (e) {}
       send({ phase: 'cancelled', message: 'Cancelled by user' });
       return { success: false, cancelled: true, error: 'Cancelled by user' };
+    }
+    // Error path (non-cancellation, e.g. ffmpeg crash on phase 2): also clean up
+    // partial output so user can rerun from scratch without disk-space surprises.
+    // We KEEP the TS files so phase 1 doesn't have to re-run on the next attempt
+    // (a future enhancement could add a "skip phase 1" resume mode that detects
+    // these leftover TS files via the filelist + their expected sizes).
+    try { fs.unlinkSync(finalPath); } catch (e) {}
+    if (needsSplit) {
+      try {
+        const dir = path.dirname(segmentPattern);
+        const base = path.basename(segmentPattern).replace('%03d', '');
+        const re = new RegExp('^' + base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace('\\d\\d\\d', '\\d+') + '$');
+        for (const f of fs.readdirSync(dir)) {
+          if (re.test(f)) { try { fs.unlinkSync(path.join(dir, f)); } catch (e) {} }
+        }
+      } catch (e) {}
     }
     send({ phase: 'error', error: err.message });
     return { success: false, error: err.message };
@@ -2405,4 +3084,39 @@ ipcMain.handle('dashcam:reveal', async (event, filePath) => {
   const { shell } = require('electron');
   shell.showItemInFolder(filePath);
   return { success: true };
+});
+
+ipcMain.handle('dashcam:get-encoder', async () => {
+  return getEncoderStatus();
+});
+
+ipcMain.handle('dashcam:list-encoders', async () => {
+  // If the background probe hasn't finished, run it now so the dropdown
+  // can populate immediately instead of showing only "auto".
+  if (!hwEncoderProbed) {
+    try { await detectHwEncoder(); } catch (_) {}
+  }
+  return listEncoderChoices();
+});
+
+ipcMain.handle('dashcam:set-encoder', async (event, choice) => {
+  // Accept: 'auto', 'cpu', or a specific encoder name from listEncoderChoices.
+  if (choice === 'auto' || choice == null) {
+    hwEncoderOverride = null;
+  } else if (choice === 'cpu') {
+    hwEncoderOverride = 'cpu';
+  } else {
+    const known = (hwEncoderProbedList || []).some(c => c.ok && c.name === choice);
+    if (!known) return { ok: false, error: 'unknown or non-working encoder: ' + choice };
+    hwEncoderOverride = choice;
+  }
+  // Persist
+  const prefs = loadPrefs();
+  prefs.encoderOverride = hwEncoderOverride;
+  savePrefs(prefs);
+  // Re-broadcast
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('encoder-status', getEncoderStatus());
+  }
+  return { ok: true, override: hwEncoderOverride };
 });

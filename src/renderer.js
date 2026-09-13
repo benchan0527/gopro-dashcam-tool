@@ -17,7 +17,84 @@ if (!electronAPI) {
   });
 }
 
-// Get path and fs from electronAPI if available
+// ===== Encoder status badge / dropdown =====
+// Query main process for the detected HW encoder and display it. The probe
+// runs in the background at startup; the renderer also subscribes to live
+// updates. The dropdown lets the user override the auto-detect.
+(function initEncoderBadge() {
+  if (!electronAPI) return;
+
+  const select   = document.getElementById('dc-encoder-select');
+  const statusEl = document.getElementById('dc-encoder-status');
+  const badge    = document.getElementById('dc-encoder-badge');
+  if (!select || !statusEl || !badge) return;
+
+  // Populate dropdown from main process.
+  const populate = async () => {
+    let choices;
+    try { choices = await electronAPI.dashcamListEncoders(); }
+    catch (e) { choices = { working: [], failed: [], override: null, probed: false }; }
+    select.innerHTML = '';
+    const opt0 = document.createElement('option');
+    opt0.value = 'auto';
+    opt0.textContent = 'Auto (use best available)';
+    select.appendChild(opt0);
+    for (const enc of (choices.working || [])) {
+      const o = document.createElement('option');
+      o.value = enc.name;
+      o.textContent = `${enc.name} — ${enc.hwaccel}`;
+      select.appendChild(o);
+    }
+    const cpu = document.createElement('option');
+    cpu.value = 'cpu';
+    cpu.textContent = 'CPU libx264 (force)';
+    select.appendChild(cpu);
+    select.disabled = !(choices.probed);
+    select.value = choices.override || 'auto';
+    if (choices.failed && choices.failed.length) {
+      const detail = choices.failed.map(f => f.name).join(', ');
+      badge.title = 'Failed probes: ' + detail;
+    }
+  };
+
+  // Update status line + tooltip from a status object.
+  const apply = (status) => {
+    if (!status) return;
+    statusEl.textContent = (status.label || '').replace(/ — auto$/, '').replace(/ — manual$/, '');
+    if (status.ok === true) {
+      statusEl.style.color = '#6f6';   // green = HW encoder
+      badge.title = `Auto-detected: ${status.name} (${status.hwaccel})`;
+    } else if (status.ok === false) {
+      statusEl.style.color = '#fc6';   // amber = CPU fallback
+      if (status.reason) badge.title = `Last probe failure: ${status.reason}`;
+    } else {
+      statusEl.style.color = '#9bd';
+    }
+  };
+
+  // On change, push override to main and let the broadcast come back.
+  select.addEventListener('change', async () => {
+    const v = select.value;
+    statusEl.textContent = 'switching…';
+    statusEl.style.color = '#9bd';
+    try {
+      const r = await electronAPI.dashcamSetEncoder(v);
+      if (!r || !r.ok) {
+        statusEl.textContent = 'failed to switch';
+        statusEl.style.color = '#f66';
+      }
+    } catch (e) {
+      statusEl.textContent = 'failed to switch';
+      statusEl.style.color = '#f66';
+    }
+  });
+
+  populate();
+  electronAPI.dashcamGetEncoder().then(apply).catch(() => {});
+  if (typeof electronAPI.onEncoderStatus === 'function') {
+    electronAPI.onEncoderStatus(apply);
+  }
+})();
 let path = electronAPI?.path || null;
 let fs = electronAPI?.fs || null;
 if (path && fs) {
@@ -1220,6 +1297,7 @@ const dc = {
       outputName: this.$('dc-output-name').value.trim(),
       tempDir: this.$('dc-temp-folder').value.trim() || null,
       cleanupTs: this.$('dc-cleanup-ts').checked,
+      rotate180: this.$('dc-rotate-180').checked,
       maxSegmentBytes: this.$('dc-enable-split').checked
         ? Math.max(1, parseInt(this.$('dc-max-gb').value, 10) || 256) * 1024 * 1024 * 1024
         : Infinity,           // effectively disable splitting
@@ -1331,7 +1409,21 @@ const dc = {
 
         if (p.stage === 'skipped') {
           this.setInfo('stage', `Skipped ${p.tsIndex}/${p.tsTotal} (corrupt)`, false, true);
+        } else if (p.stage === 'progress') {
+          // Mid-conversion progress (rotation re-encode can take 30s+ per GB).
+          // Show per-file % so users know something is happening between 'starting'
+          // and 'done' — without this, the UI looked frozen during rotation.
+          const filePct = p.fileSize > 0 && p.currentFileDone != null
+            ? Math.round((p.currentFileDone / p.fileSize) * 100)
+            : null;
+          const stageLabel = (p.message && p.message.includes('Rotat'))
+            ? 'Rotating + encoding'
+            : 'Converting';
+          this.setInfo('stage',
+            `${stageLabel} · ${p.tsIndex}/${p.tsTotal}` + (filePct != null ? ` · ${filePct}%` : ''),
+            false, false);
         } else {
+          // 'starting' or 'done'
           this.setInfo('stage', p.stage === 'done'
             ? `Converting  ·  ${p.tsIndex}/${p.tsTotal}`
             : 'Converting');

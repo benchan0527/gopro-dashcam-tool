@@ -1,9 +1,10 @@
 {
   "name": "gopro-dashcam-tool",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "description": "Merge GoPro / dashcam footage and extract GPS / G-Force / Speed telemetry as SRT subtitles",
   "main": "src/main.js",
   "scripts": {
+    "postinstall": "node scripts/download-ffmpeg.js",
     "start": "electron .",
     "extract": "node extract.js",
     "test": "node extract.js",
@@ -38,7 +39,7 @@
     "productName": "GoPro Dashcam Tool",
     "asar": true,
     "directories": {
-      "output": "dist",
+      "output": "C:\\temp\\gopro-build",
       "buildResources": "resources"
     },
     "files": [
